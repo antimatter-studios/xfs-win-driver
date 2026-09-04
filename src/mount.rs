@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fs_core::BlockRead;
+use fs_xfs::inode::Inode;
 use fs_xfs::Filesystem;
 use winfsp_fs_skeleton::device::{BlockSource, FileSource};
 use winfsp_fs_skeleton::partition;
@@ -87,12 +88,17 @@ pub enum DismountPolicy {
     /// Serialise the overlay to a JSON sidecar at the given path.
     /// Requires the `overlay-sidecar` Cargo feature.
     Sidecar(PathBuf),
-    /// Walk the merged tree (overlay + underlay) and emit a NEW XFS
-    /// image at the given path via `fs_xfs::mkfs::build_image`.
-    /// This is the "commit my writes back to disk" mode — the original
-    /// image is left untouched and the new one carries every Created /
-    /// Modified / non-Deleted entry.
-    Rebuild(PathBuf),
+    // NO `Rebuild` VARIANT, unlike erofs-win-driver. That mode
+    // serialises the overlay back into a fresh image, and for EROFS it
+    // does so through `fs_erofs::mkfs::build_image`. `am-fs-xfs` has no
+    // mkfs module: building an XFS filesystem from nothing is
+    // unfinished work — the superblock writer landed, the allocation
+    // group headers, btrees, root inode and log have not.
+    //
+    // Left absent rather than stubbed. A variant that always returns
+    // "not supported" is a promise in the type that the code cannot
+    // keep, and `--scratch-rebuild` would appear in `--help` as though
+    // it might work. When mkfs.xfs exists, this comes back.
 }
 
 /// Per-mount writability flag. `Writable` is the new default — writes
@@ -242,6 +248,28 @@ impl Mount {
     /// by the integration tests to verify the read path WITHOUT linking
     /// the WinFsp adapter — the WinFsp `read` callback uses the same
     /// precedence rules.
+    /// Read a whole file, fetching the raw inode fork the reader needs.
+    ///
+    /// `am-fs-xfs` threads the raw inode bytes through `read_file` and
+    /// `read_dir`, because an XFS inode keeps its extents and inline
+    /// data in that fork -- the parsed `Inode` alone is not enough. So
+    /// every read here is really two: resolve, then re-fetch.
+    ///
+    /// `lookup_path` has already read those bytes and discarded them,
+    /// which is the waste a handle-style API would remove (a `File`
+    /// would hold them from the lookup onward). Until that exists this
+    /// is one helper rather than the same three lines at five call
+    /// sites.
+    fn read_whole(&self, inode: &Inode) -> std::result::Result<Vec<u8>, &'static str> {
+        let (inode, raw) = self
+            .fs
+            .read_inode_raw(inode.ino)
+            .map_err(|_| "underlay read error")?;
+        self.fs
+            .read_file(&inode, &raw)
+            .map_err(|_| "underlay read error")
+    }
+
     pub fn read_path(&self, unix_path: &str) -> std::result::Result<Vec<u8>, &'static str> {
         match self.overlay.lookup(unix_path) {
             OverlayLookup::Hit(OverlayEntry::Created { content, .. })
@@ -254,13 +282,7 @@ impl Mount {
                 if !inode.is_regular_file() {
                     return Err("not a regular file");
                 }
-                let mut buf = vec![0u8; inode.size as usize];
-                if !buf.is_empty() {
-                    self.fs
-                        .read_file(&inode, 0, &mut buf)
-                        .map_err(|_| "underlay read error")?;
-                }
-                Ok(buf)
+                self.read_whole(&inode)
             }
         }
     }
@@ -286,15 +308,7 @@ impl Mount {
                 return Err("write on tombstoned path")
             }
             OverlayLookup::Miss => match self.fs.lookup_path(unix_path) {
-                Ok(inode) if inode.is_regular_file() => {
-                    let mut existing = vec![0u8; inode.size as usize];
-                    if !existing.is_empty() {
-                        self.fs
-                            .read_file(&inode, 0, &mut existing)
-                            .map_err(|_| "underlay read error")?;
-                    }
-                    (existing, inode.mode)
-                }
+                Ok(inode) if inode.is_regular_file() => (self.read_whole(&inode)?, inode.mode),
                 Ok(_) => return Err("write on non-regular underlay entry"),
                 Err(_) => return Err("write on missing path"),
             },
@@ -330,15 +344,7 @@ impl Mount {
                 return Err("set_size on tombstoned path")
             }
             OverlayLookup::Miss => match self.fs.lookup_path(unix_path) {
-                Ok(inode) if inode.is_regular_file() => {
-                    let mut existing = vec![0u8; inode.size as usize];
-                    if !existing.is_empty() {
-                        self.fs
-                            .read_file(&inode, 0, &mut existing)
-                            .map_err(|_| "underlay read error")?;
-                    }
-                    (existing, inode.mode)
-                }
+                Ok(inode) if inode.is_regular_file() => (self.read_whole(&inode)?, inode.mode),
                 Ok(_) => return Err("set_size on non-regular underlay entry"),
                 Err(_) => return Err("set_size on missing path"),
             },
@@ -364,7 +370,6 @@ impl Mount {
                 Ok(())
             }
             DismountPolicy::Sidecar(path) => write_sidecar(&self.overlay, path),
-            DismountPolicy::Rebuild(path) => rebuild_image(&self.fs, &self.overlay, path),
         }
     }
 
@@ -417,143 +422,6 @@ fn write_sidecar(_overlay: &Overlay, path: &Path) -> Result<()> {
     );
 }
 
-/// Walk the merged tree (overlay + underlay), build an `mkfs::Node`
-/// reflecting the post-overlay state, and emit a new XFS image at
-/// `out_path`. The original underlay image is untouched. Block size is
-/// inherited from the underlay's superblock so the rebuilt image keeps
-/// the same on-disk geometry.
-fn rebuild_image(fs: &Filesystem, overlay: &Overlay, out_path: &Path) -> Result<()> {
-    use fs_xfs::mkfs::{build_image, Node, NodeMeta, DEFAULT_DIR_MODE, DEFAULT_FILE_MODE};
-    use std::collections::BTreeMap;
-
-    fn build_node(fs: &Filesystem, overlay: &Overlay, path: &str) -> Result<Option<Node>> {
-        // Overlay precedence at the path itself.
-        match overlay.lookup(path) {
-            OverlayLookup::Deleted => return Ok(None),
-            OverlayLookup::Hit(OverlayEntry::Created { content, mode, .. })
-            | OverlayLookup::Hit(OverlayEntry::Modified { content, mode, .. }) => {
-                return Ok(Some(Node::File {
-                    mode,
-                    data: content,
-                    meta: NodeMeta::default(),
-                    xattrs: Vec::new(),
-                }));
-            }
-            OverlayLookup::Hit(OverlayEntry::CreatedDir { mode, .. }) => {
-                let mut entries: BTreeMap<String, Node> = BTreeMap::new();
-                for (leaf, _) in overlay.iter_dir(path) {
-                    let child_path = if path == "/" {
-                        format!("/{leaf}")
-                    } else {
-                        format!("{path}/{leaf}")
-                    };
-                    if let Some(node) = build_node(fs, overlay, &child_path)? {
-                        entries.insert(leaf, node);
-                    }
-                }
-                return Ok(Some(Node::Dir {
-                    mode,
-                    entries,
-                    meta: NodeMeta::default(),
-                    xattrs: Vec::new(),
-                }));
-            }
-            OverlayLookup::Hit(OverlayEntry::Deleted) => {
-                // `lookup` returns `OverlayLookup::Deleted` for tombstones,
-                // so a `Hit(Deleted)` is unreachable in practice. Defensive
-                // arm: behave as if the path is gone.
-                return Ok(None);
-            }
-            OverlayLookup::Miss => {}
-        }
-
-        // Underlay path. Look up the inode; absent → return None
-        // (treated as a non-existent path).
-        let inode = match fs.lookup_path(path) {
-            Ok(i) => i,
-            Err(_) => return Ok(None),
-        };
-        if inode.is_dir() {
-            // Merge underlay children with overlay entries.
-            let mut entries: BTreeMap<String, Node> = BTreeMap::new();
-            // Underlay-listed children first; overlay tombstones drop
-            // them, overlay entries replace them via the recursion.
-            let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-            if let Ok(children) = fs.read_dir(&inode) {
-                for child in children {
-                    if child.name == b"." || child.name == b".." {
-                        continue;
-                    }
-                    let name = match std::str::from_utf8(&child.name) {
-                        Ok(s) => s.to_string(),
-                        Err(_) => continue,
-                    };
-                    let child_path = if path == "/" {
-                        format!("/{name}")
-                    } else {
-                        format!("{path}/{name}")
-                    };
-                    seen.insert(name.clone());
-                    if let Some(node) = build_node(fs, overlay, &child_path)? {
-                        entries.insert(name, node);
-                    }
-                }
-            }
-            // Pure-overlay creations under this dir that the underlay
-            // never had.
-            for (leaf, _) in overlay.iter_dir(path) {
-                if seen.contains(&leaf) {
-                    continue;
-                }
-                let child_path = if path == "/" {
-                    format!("/{leaf}")
-                } else {
-                    format!("{path}/{leaf}")
-                };
-                if let Some(node) = build_node(fs, overlay, &child_path)? {
-                    entries.insert(leaf, node);
-                }
-            }
-            return Ok(Some(Node::Dir {
-                mode: DEFAULT_DIR_MODE,
-                entries,
-                meta: NodeMeta::default(),
-                xattrs: Vec::new(),
-            }));
-        }
-        if inode.is_regular_file() {
-            let mut buf = vec![0u8; inode.size as usize];
-            if !buf.is_empty() {
-                fs.read_file(&inode, 0, &mut buf)
-                    .map_err(|e| anyhow!("read underlay file at {path}: {e}"))?;
-            }
-            return Ok(Some(Node::File {
-                mode: DEFAULT_FILE_MODE,
-                data: buf,
-                meta: NodeMeta::default(),
-                xattrs: Vec::new(),
-            }));
-        }
-        // Symlinks / special files / chunked / compressed: skipped in
-        // the rebuild path. The mkfs builder supports symlinks but we
-        // can't easily round-trip without a target; v1 of the rebuild
-        // pipeline focuses on regular-files-and-dirs which is what the
-        // overlay can mutate anyway.
-        Ok(None)
-    }
-
-    let root = build_node(fs, overlay, "/")?
-        .ok_or_else(|| anyhow!("rebuild: root path resolved to None — empty tree?"))?;
-    let blkszbits = (fs.superblock().block_size().trailing_zeros()) as u8;
-    let bytes = build_image(root, blkszbits).map_err(|e| anyhow!("rebuild XFS image: {e}"))?;
-    std::fs::write(out_path, bytes)
-        .with_context(|| format!("write rebuilt image to {}", out_path.display()))?;
-    Ok(())
-}
-
-/// Best-effort hint shown when a direct mount fails on what looks like
-/// a partitioned device. Mirrors the ext4-win-driver hint structure but
-/// keeps the listing format short — suggest `--part N` with the kind.
 fn partition_hint(image: &Path) -> String {
     match partition::list(image) {
         Ok(parts) if !parts.is_empty() => {
@@ -630,7 +498,7 @@ mod winfsp_adapter {
         DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, ModificationDescriptor,
         OpenFileInfo, VolumeInfo, WideNameInfo,
     };
-    use winfsp::host::{FileSystemHost, VolumeParams};
+    use winfsp::host::{FileSystemHost, FineGuard, VolumeParams};
     use winfsp::Result as FspResult;
     // FILE_FLAGS_AND_ATTRIBUTES from winfsp_sys is the bindgen u32
     // alias the FileSystemContext trait expects; the windows crate's
@@ -639,13 +507,11 @@ mod winfsp_adapter {
     // is in scope on x64 / arm64 builds).
     use winfsp_sys::{FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES};
 
-    use fs_xfs::{FileType, Filesystem, Inode};
+    use fs_xfs::dir::DirEntry as XfsDirEntry;
+    use fs_xfs::inode::{FileType, Inode};
+    use fs_xfs::Filesystem;
 
     use super::{Mount, OverlayEntry, OverlayLookup, WriteMode};
-
-    /// Seconds between Windows FILETIME epoch (1601-01-01) and Unix
-    /// epoch (1970-01-01).
-    const FILETIME_EPOCH_OFFSET_SEC: u64 = 11_644_473_600;
 
     /// IO_REPARSE_TAG_SYMLINK — Microsoft public symlink tag. We surface
     /// XFS symlinks as Windows reparse points so Explorer can render
@@ -654,17 +520,13 @@ mod winfsp_adapter {
     /// require an extra feature gate.
     const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
 
-    /// Convert a unix-epoch-seconds timestamp to a FILETIME (100-ns
-    /// intervals since 1601). Saturating on overflow — XFS stores
-    /// 64-bit seconds, FILETIME is 64-bit 100-ns ticks; for any
-    /// realistic mtime the multiplication fits comfortably.
-    fn unix_to_filetime(secs: u64, nsec: u32) -> u64 {
-        let secs_part = FILETIME_EPOCH_OFFSET_SEC
-            .saturating_add(secs)
-            .saturating_mul(10_000_000);
-        let nsec_part = (nsec as u64) / 100;
-        secs_part.saturating_add(nsec_part)
-    }
+    // The Unix-to-FILETIME conversion lives in winfsp-fs-skeleton.
+    // This module had the fourth copy of it in the family -- erofs and
+    // ext4 had two more, at three different widths between them -- and
+    // this one took `u64` seconds, which cannot even express XFS's
+    // `Timestamp.sec`. The shared one takes `i64`, so an XFS timestamp
+    // passes through unchanged and a date before 1970 survives.
+    use winfsp_fs_skeleton::translate::unix_to_filetime;
 
     /// `\foo\bar` (UTF-16) → `/foo/bar` (UTF-8). Empty path becomes "/".
     fn winpath_to_unix(name: &U16CStr) -> Result<String> {
@@ -711,12 +573,12 @@ mod winfsp_adapter {
         // Round allocation up to 4 KiB. XFS doesn't track on-disk
         // allocation distinct from logical size for our purposes.
         info.allocation_size = (inode.size + 4095) & !4095;
-        let ft = unix_to_filetime(inode.mtime, inode.mtime_nsec);
+        let ft = unix_to_filetime(inode.mtime.sec, inode.mtime.nsec);
         info.creation_time = ft;
         info.last_access_time = ft;
         info.last_write_time = ft;
         info.change_time = ft;
-        info.index_number = inode.nid;
+        info.index_number = inode.ino;
         info.hard_links = 0;
         info.ea_size = 0;
     }
@@ -740,7 +602,10 @@ mod winfsp_adapter {
         info.reparse_tag = 0;
         info.file_size = entry.content().map(|c| c.len() as u64).unwrap_or(0);
         info.allocation_size = (info.file_size + 4095) & !4095;
-        let ft = unix_to_filetime(entry.mtime(), 0);
+        // The overlay stamps entries with unsigned seconds; the shared
+        // converter takes signed. Checked rather than cast: `u64::MAX
+        // as i64` is -1, which would render as 1969.
+        let ft = unix_to_filetime(i64::try_from(entry.mtime()).unwrap_or(i64::MAX), 0);
         info.creation_time = ft;
         info.last_access_time = ft;
         info.last_write_time = ft;
@@ -755,6 +620,27 @@ mod winfsp_adapter {
         info.ea_size = 0;
     }
 
+    /// Read a whole file, fetching the raw inode fork alongside it.
+    ///
+    /// XFS threads the raw bytes through `read_file` because an inode
+    /// keeps its extents and inline data in that fork. `lookup_path`
+    /// has already read and discarded them, so this is a second read --
+    /// the cost a handle-style reader API would remove.
+    fn read_whole(fs: &Filesystem, inode: &Inode) -> FspResult<Vec<u8>> {
+        let (inode, raw) = fs.read_inode_raw(inode.ino).map_err(err_to_status)?;
+        fs.read_file(&inode, &raw)
+            .map_err(|e| err_to_status(e).into())
+    }
+
+    /// List a directory, fetching the raw inode fork alongside it.
+    /// Short-form directories store their entries inside the inode, so
+    /// the parsed struct alone is not enough.
+    fn read_children(fs: &Filesystem, inode: &Inode) -> FspResult<Vec<XfsDirEntry>> {
+        let (inode, raw) = fs.read_inode_raw(inode.ino).map_err(err_to_status)?;
+        fs.read_dir(&inode, &raw)
+            .map_err(|e| err_to_status(e).into())
+    }
+
     /// Map an `fs_xfs::Error` to an NTSTATUS suitable for returning
     /// from a WinFsp callback. Most lookup-style failures collapse to
     /// `STATUS_OBJECT_NAME_NOT_FOUND` — Explorer / consumer apps treat
@@ -764,7 +650,12 @@ mod winfsp_adapter {
     fn err_to_status(err: fs_xfs::Error) -> windows::Win32::Foundation::NTSTATUS {
         use fs_xfs::Error as E;
         match err {
-            E::NotFound | E::NotADirectory | E::BadDirent(_) => STATUS_OBJECT_NAME_NOT_FOUND,
+            // No BadDirent: XFS's error type has no dirent-specific
+            // corruption variant, unlike EROFS's. NotAFile joins the
+            // lookup-style failures for the same reason the others do --
+            // to a caller they all mean "that path is not what you
+            // asked for".
+            E::NotFound | E::NotADirectory | E::NotAFile => STATUS_OBJECT_NAME_NOT_FOUND,
             _ => STATUS_INVALID_DEVICE_REQUEST,
         }
     }
@@ -802,8 +693,8 @@ mod winfsp_adapter {
     impl XfsContext {
         pub fn new(mount: Mount) -> Result<Self> {
             let sb = mount.fs.superblock();
-            let label = sb.volume_name_str().to_string();
-            let total_size = (sb.blocks as u64) * sb.block_size();
+            let label = sb.fname.clone();
+            let total_size = sb.dblocks * u64::from(sb.blocksize);
             Ok(Self {
                 mount,
                 label,
@@ -867,12 +758,7 @@ mod winfsp_adapter {
                     if !inode.is_regular_file() {
                         return Err(STATUS_INVALID_DEVICE_REQUEST.into());
                     }
-                    let mut buf = vec![0u8; inode.size as usize];
-                    if !buf.is_empty() {
-                        self.fs()
-                            .read_file(&inode, 0, &mut buf)
-                            .map_err(|e| err_to_status(e))?;
-                    }
+                    let buf = read_whole(self.fs(), &inode)?;
                     Ok((buf, inode.mode))
                 }
             }
@@ -1035,10 +921,16 @@ mod winfsp_adapter {
             }
             let remaining = inode.size - offset;
             let take = (buffer.len() as u64).min(remaining) as usize;
-            self.fs()
-                .read_file(&inode, offset, &mut buffer[..take])
-                .map_err(|e| err_to_status(e))?;
-            Ok(take as u32)
+            // XFS's read_file has no offset form -- it returns the whole
+            // file -- so the range is taken here. Fine for an escape
+            // hatch; a driver serving large files would want the reader
+            // to grow a ranged read rather than paying this per call.
+            let whole = read_whole(self.fs(), &inode)?;
+            let from = offset as usize;
+            let end = (from + take).min(whole.len());
+            let n = end.saturating_sub(from);
+            buffer[..n].copy_from_slice(&whole[from..end]);
+            Ok(n as u32)
         }
 
         fn read_directory(
@@ -1065,7 +957,7 @@ mod winfsp_adapter {
             let underlay_inode = context.inode.lock().unwrap().clone();
             let mut underlay_pairs: Vec<(String, Inode)> = Vec::new();
             if let Some(inode) = underlay_inode.as_ref() {
-                if let Ok(children) = self.fs().read_dir(inode) {
+                if let Ok(children) = read_children(self.fs(), inode) {
                     for e in children {
                         if e.name == b"." || e.name == b".." {
                             continue;
@@ -1086,7 +978,7 @@ mod winfsp_adapter {
                         ) {
                             continue;
                         }
-                        if let Ok(child) = self.fs().read_inode(e.nid) {
+                        if let Ok(child) = self.fs().read_inode(e.ino) {
                             underlay_pairs.push((name, child));
                         }
                     }
@@ -1407,13 +1299,7 @@ mod winfsp_adapter {
                     if inode.is_dir() {
                         (Vec::new(), inode.mode, true)
                     } else if inode.is_regular_file() {
-                        let mut buf = vec![0u8; inode.size as usize];
-                        if !buf.is_empty() {
-                            self.fs()
-                                .read_file(&inode, 0, &mut buf)
-                                .map_err(|e| err_to_status(e))?;
-                        }
-                        (buf, inode.mode, false)
+                        (read_whole(self.fs(), &inode)?, inode.mode, false)
                     } else {
                         return Err(STATUS_INVALID_DEVICE_REQUEST.into());
                     }
@@ -1542,7 +1428,7 @@ mod winfsp_adapter {
         let dismount_image = mount.image.clone();
 
         let ctx = XfsContext::new(mount)?;
-        let block_size = ctx.fs().superblock().block_size();
+        let block_size = ctx.fs().superblock().blocksize;
         let sector = block_size.min(4096) as u16;
 
         let mut params = VolumeParams::new();
@@ -1562,7 +1448,10 @@ mod winfsp_adapter {
             params.read_only_volume(true);
         }
 
-        let mut host = FileSystemHost::new(params, ctx)
+        // Named rather than inferred: winfsp-rs 0.13.0 carries the
+        // locking strategy as a type parameter, and two impls' methods
+        // collide when it is left open -- E0034 at the mount() call.
+        let mut host = FileSystemHost::<_, FineGuard>::new(params, ctx)
             .map_err(|e| anyhow!("FileSystemHost::new failed: {e}"))?;
 
         host.mount(mount_point)
@@ -1596,20 +1485,6 @@ mod winfsp_adapter {
                     eprintln!("warning: --scratch-sidecar failed: {e:#}");
                 }
             }
-            super::DismountPolicy::Rebuild(path) => {
-                // Re-open the underlay for the rebuild walk.
-                match super::Mount::open_direct(&dismount_image) {
-                    Ok(reopened) => {
-                        if let Err(e) = super::rebuild_image(&reopened.fs, &dismount_overlay, path)
-                        {
-                            eprintln!("warning: --scratch-rebuild failed: {e:#}");
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("warning: --scratch-rebuild reopen failed: {e:#}");
-                    }
-                }
-            }
         }
         Ok(())
     }
@@ -1635,9 +1510,16 @@ mod tests {
     //! and that the resulting `Filesystem` exposes the basic info needed
     //! to populate `VolumeInfo` and a directory listing.
 
+    // `super::*` is only needed by the image-fixture tests, which are
+    // gated until am-fs-xfs can format. The tests that remain are pure
+    // and name what they use.
+    #[cfg(feature = "xfs-mkfs-fixtures")]
     use super::*;
+    #[cfg(feature = "xfs-mkfs-fixtures")]
     use std::io::Write;
 
+    /// Gated with the fixture it exists to write out.
+    #[cfg(feature = "xfs-mkfs-fixtures")]
     fn write_tempimg(bytes: &[u8]) -> tempfile::NamedTempFile {
         let mut tf = tempfile::NamedTempFile::new().expect("tempfile");
         tf.write_all(bytes).expect("write");
@@ -1656,6 +1538,12 @@ mod tests {
     /// workspace and not always compilable. Field offsets / magic
     /// constants come from the `xfs_fs.h` spec (also documented in
     /// `am_fs_xfs::superblock`, `inode`, and `dir`).
+    /// Hand-built image fixture, inherited from the EROFS driver this
+    /// was ported from and therefore NOT a valid XFS volume — it writes
+    /// an EROFS superblock at EROFS's offset, so XFS reads offset 0 and
+    /// sees zeros. Gated with its callers until there is an XFS
+    /// formatter to replace it.
+    #[cfg(feature = "xfs-mkfs-fixtures")]
     fn build_simple_image() -> Vec<u8> {
         const BS: usize = 4096;
         const SUPER_OFFSET: usize = 1024;
@@ -1687,8 +1575,7 @@ mod tests {
         img[off..off + 2].copy_from_slice(&raw_format.to_le_bytes());
         img[off + 0x04..off + 0x06].copy_from_slice(&0o100644u16.to_le_bytes()); // S_IFREG|0644
         img[off + 0x06..off + 0x08].copy_from_slice(&1u16.to_le_bytes()); // nlink
-        img[off + 0x08..off + 0x0C]
-            .copy_from_slice(&(b"hi from xfs\n".len() as u32).to_le_bytes());
+        img[off + 0x08..off + 0x0C].copy_from_slice(&(b"hi from xfs\n".len() as u32).to_le_bytes());
         img[off + 0x10..off + 0x14].copy_from_slice(&2u32.to_le_bytes()); // raw_blkaddr=2
 
         // -- File data at block 2 ------------------------------------------
@@ -1709,6 +1596,12 @@ mod tests {
         img
     }
 
+    // Needs a real XFS image and there is no way to make one: the
+    // fixture below is the EROFS builder this driver was ported from,
+    // so XFS reads offset 0 and finds zeros. Building a valid XFS image
+    // by hand is the mkfs work that does not exist yet. Kept, not
+    // deleted -- the test is sound, the fixture is missing.
+    #[cfg(feature = "xfs-mkfs-fixtures")]
     #[test]
     fn mount_open_direct_smoke() {
         let img = build_simple_image();
@@ -1717,7 +1610,8 @@ mod tests {
         // Sanity: we can read the root and list entries.
         let root = m.fs.root_inode().expect("root");
         assert!(root.is_dir());
-        let entries = m.fs.read_dir(&root).expect("read_dir");
+        let (root, raw) = m.fs.read_inode_raw(root.ino).expect("root raw");
+        let entries = m.fs.read_dir(&root, &raw).expect("read_dir");
         let names: Vec<&[u8]> = entries.iter().map(|e| e.name.as_slice()).collect();
         assert!(
             names.iter().any(|n| *n == b"hello.txt"),
@@ -1725,6 +1619,12 @@ mod tests {
         );
     }
 
+    // Needs a real XFS image and there is no way to make one: the
+    // fixture below is the EROFS builder this driver was ported from,
+    // so XFS reads offset 0 and finds zeros. Building a valid XFS image
+    // by hand is the mkfs work that does not exist yet. Kept, not
+    // deleted -- the test is sound, the fixture is missing.
+    #[cfg(feature = "xfs-mkfs-fixtures")]
     #[test]
     fn mount_open_part_zero_treated_as_direct() {
         // `Some(0)` should behave identically to `None` — i.e. open the
@@ -1738,6 +1638,12 @@ mod tests {
         assert!(root.is_dir());
     }
 
+    // Needs a real XFS image and there is no way to make one: the
+    // fixture below is the EROFS builder this driver was ported from,
+    // so XFS reads offset 0 and finds zeros. Building a valid XFS image
+    // by hand is the mkfs work that does not exist yet. Kept, not
+    // deleted -- the test is sound, the fixture is missing.
+    #[cfg(feature = "xfs-mkfs-fixtures")]
     #[test]
     fn volume_info_math_matches_superblock() {
         // Mirror what the WinFsp `get_volume_info` callback computes,
@@ -1748,13 +1654,19 @@ mod tests {
         let tf = write_tempimg(&img);
         let m = Mount::open(tf.path(), None).expect("open");
         let sb = m.fs.superblock();
-        let total = (sb.blocks as u64) * sb.block_size();
+        let total = sb.dblocks * u64::from(sb.blocksize);
         assert_eq!(total, 4 * 4096, "expected 16 KiB total, got {total}");
         // RO surface — free is always zero.
         let free: u64 = 0;
         assert_eq!(free, 0);
     }
 
+    // Shares the fixture above, so it is gated with it. This one would
+    // arguably pass regardless -- it asserts a FAILURE -- but passing
+    // for the wrong reason is worse than not running: an invalid image
+    // fails partition-open for reasons that have nothing to do with the
+    // range check it is meant to exercise.
+    #[cfg(feature = "xfs-mkfs-fixtures")]
     #[test]
     fn mount_open_partition_out_of_range_errors() {
         // No partition table in our test image; asking for --part 1

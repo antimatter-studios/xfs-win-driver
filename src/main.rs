@@ -85,42 +85,61 @@ enum Cmd {
         /// Discard the in-memory overlay on dismount (default). The
         /// canonical "read-only volume that pretended to be writable"
         /// behaviour — every staged write disappears at unmount.
-        #[arg(long, conflicts_with_all = ["scratch_sidecar", "scratch_rebuild"])]
+        #[arg(long, conflicts_with = "scratch_sidecar")]
         scratch_discard: bool,
         /// Serialise the overlay state to a JSON sidecar at the given
         /// path on dismount. Useful for replay / audit. Requires the
         /// `overlay-sidecar` Cargo feature; without it the binary
         /// emits a clear error at unmount time rather than silently
         /// dropping the data.
-        #[arg(long, conflicts_with = "scratch_rebuild")]
-        scratch_sidecar: Option<PathBuf>,
-        /// Walk the merged overlay+underlay tree on dismount and emit
-        /// a NEW XFS image at the given path. The original image is
-        /// untouched. This is the "commit my writes back to disk" mode.
         #[arg(long)]
-        scratch_rebuild: Option<PathBuf>,
+        scratch_sidecar: Option<PathBuf>,
+        // NO --scratch-rebuild. The sibling erofs driver has one: it
+        // serialises the overlay into a fresh image via that reader's
+        // mkfs. am-fs-xfs has no mkfs module, so there is nothing to
+        // build an image with, and a flag that always fails is worse
+        // than a flag that is absent -- it appears in --help as though
+        // it might work.
     },
 }
 
 fn open_fs(img: &PathBuf) -> Result<Filesystem> {
     let dev = FileDevice::open(img).with_context(|| format!("opening {}", img.display()))?;
     let dev: Arc<dyn BlockRead> = Arc::new(dev);
-    Filesystem::open(dev).map_err(|e| anyhow!("open XFS: {e}"))
+    Filesystem::mount(dev).map_err(|e| anyhow!("mount XFS: {e}"))
 }
 
 fn cmd_info(img: &PathBuf) -> Result<()> {
     let fs = open_fs(img)?;
     let sb = fs.superblock();
-    println!("magic            0x{:08X}", sb.magic);
-    println!("block size       {}", sb.block_size());
-    println!("blocks           {}", sb.blocks);
-    println!("inodes           {}", sb.inos);
-    println!("root nid         {}", sb.root_nid);
-    println!("meta_blkaddr     {}", sb.meta_blkaddr);
-    println!("xattr_blkaddr    {}", sb.xattr_blkaddr);
-    println!("volume name      {:?}", sb.volume_name_str());
-    println!("feature_compat   0x{:08X}", sb.feature_compat);
-    println!("feature_incompat 0x{:08X}", sb.feature_incompat);
+    // These are XFS's fields, not EROFS's. The port arrived here with
+    // `root_nid`, `meta_blkaddr` and `xattr_blkaddr` printed -- EROFS
+    // concepts with no XFS counterpart, produced by renaming
+    // identifiers in a file whose content was never about XFS. Same
+    // class of error the probe had, and the same reason it compiled:
+    // nothing is syntactically wrong with printing a field that means
+    // something else.
+    println!("version          v{}", sb.version());
+    println!("block size       {}", sb.blocksize);
+    println!("sector size      {}", sb.sectsize);
+    println!("inode size       {}", sb.inodesize);
+    println!("data blocks      {}", sb.dblocks);
+    println!("free blocks      {}", sb.fdblocks);
+    println!("inodes           {} ({} free)", sb.icount, sb.ifree);
+    println!("root inode       {}", sb.rootino);
+    println!("AGs              {} x {} blocks", sb.agcount, sb.agblocks);
+    println!(
+        "log              {}",
+        if sb.has_internal_log() {
+            format!("internal, {} blocks at {}", sb.logblocks, sb.logstart)
+        } else {
+            "external".to_string()
+        }
+    );
+    println!("volume name      {:?}", sb.fname);
+    println!("features2        0x{:08X}", sb.features2);
+    println!("feature_compat   0x{:08X}", sb.features_compat);
+    println!("feature_ro_compat 0x{:08X}", sb.features_ro_compat);
     Ok(())
 }
 
@@ -129,12 +148,26 @@ fn cmd_ls(img: &PathBuf, path: &str) -> Result<()> {
     let dir = fs
         .lookup_path(path)
         .map_err(|e| anyhow!("lookup {path}: {e}"))?;
+    // XFS threads the raw inode fork through read_dir: a directory's
+    // entries can live inline in the inode itself (short form), so the
+    // parsed Inode alone is not enough.
+    let (dir, raw) = fs
+        .read_inode_raw(dir.ino)
+        .map_err(|e| anyhow!("read inode {path}: {e}"))?;
     let entries = fs
-        .read_dir(&dir)
+        .read_dir(&dir, &raw)
         .map_err(|e| anyhow!("read_dir {path}: {e}"))?;
     for e in entries {
+        // Names are bytes: XFS neither NUL-terminates them nor requires
+        // valid UTF-8.
         let name = String::from_utf8_lossy(&e.name);
-        println!("{:<3} {:>10} {}", e.file_type, e.nid, name);
+        // `ftype` is None when the filesystem does not record one, which
+        // is a fact about the image rather than an error.
+        let kind = match e.ftype {
+            Some(t) => format!("{t:?}"),
+            None => "?".to_string(),
+        };
+        println!("{:<10} {:>10} {}", kind, e.ino, name);
     }
     Ok(())
 }
@@ -148,8 +181,11 @@ fn cmd_cat(img: &PathBuf, path: &str) -> Result<()> {
     if !inode.is_regular_file() {
         return Err(anyhow!("{path} is not a regular file"));
     }
-    let mut buf = vec![0u8; inode.size as usize];
-    fs.read_file(&inode, 0, &mut buf)
+    let (inode, raw) = fs
+        .read_inode_raw(inode.ino)
+        .map_err(|e| anyhow!("read inode {path}: {e}"))?;
+    let buf = fs
+        .read_file(&inode, &raw)
         .map_err(|e| anyhow!("read {path}: {e}"))?;
     std::io::stdout().write_all(&buf)?;
     Ok(())
@@ -170,16 +206,7 @@ fn main() -> Result<()> {
             ro,
             scratch_discard,
             scratch_sidecar,
-            scratch_rebuild,
-        } => cmd_mount(
-            &disk,
-            &drive,
-            part,
-            ro,
-            scratch_discard,
-            scratch_sidecar,
-            scratch_rebuild,
-        ),
+        } => cmd_mount(&disk, &drive, part, ro, scratch_discard, scratch_sidecar),
     }
 }
 
@@ -194,13 +221,10 @@ fn cmd_mount(
     ro: bool,
     _scratch_discard: bool,
     scratch_sidecar: Option<PathBuf>,
-    scratch_rebuild: Option<PathBuf>,
 ) -> Result<()> {
     let path = PathBuf::from(disk);
     let policy = if let Some(p) = scratch_sidecar {
         mount::DismountPolicy::Sidecar(p)
-    } else if let Some(p) = scratch_rebuild {
-        mount::DismountPolicy::Rebuild(p)
     } else {
         // Either `--scratch-discard` was passed explicitly, or no
         // `--scratch-*` flag was supplied. Either way the policy is

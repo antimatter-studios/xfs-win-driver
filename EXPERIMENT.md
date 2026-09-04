@@ -109,10 +109,45 @@ read-write where erofs is read-only.
 
 ## State of this repo
 
-Not buildable. 8 compile errors remain, all in `mount.rs`, all genuine
-API differences rather than rename misses. `src/probe.rs` is correct
-and tested. The manifest points at sibling checkouts rather than
-vendored submodules, matching the rest of the family.
+**Builds, as of 2026-09-04.** The eight errors are fixed and CI runs on
+every push. 19 unit tests pass; clippy and rustfmt are clean.
+
+What the fixes were, since the split matters more than the count:
+
+- **Three were the reader's shape**, exactly as predicted above. XFS
+  threads the raw inode fork through `read_file` and `read_dir`, so each
+  call site pairs `read_inode_raw(ino)` with the parsed inode. They now
+  go through one `Mount::read_whole` helper rather than repeating it —
+  and note `lookup_path` has *already* read those bytes and thrown them
+  away, so every read here is two. That waste is what a handle-style API
+  would remove.
+- **Four were the overlay's rebuild path**, which serialises the overlay
+  into a fresh image through the reader's `mkfs`. `am-fs-xfs` has none,
+  so `DismountPolicy::Rebuild`, `rebuild_image` and `--scratch-rebuild`
+  are **removed rather than stubbed**. A variant that always answers
+  "not supported" is a promise the type cannot keep, and the flag would
+  have appeared in `--help` as though it might work.
+- **One was another silent rename artefact**, of the same kind as the
+  probe: `cmd_info` printed `root_nid`, `meta_blkaddr` and
+  `xattr_blkaddr` — EROFS fields with no XFS meaning — and compiled
+  fine, because nothing is syntactically wrong with printing a field
+  that means something else. It now prints XFS's own superblock.
+
+### What is gated, and why it was not deleted
+
+Four unit tests and the whole `tests/overlay_integration.rs` are behind
+`--features xfs-mkfs-fixtures`, which nothing enables. They all need a
+real XFS image, and the fixture builder inherited from the port writes
+an **EROFS** superblock — XFS reads offset 0 and finds zeros. Building a
+valid XFS image by hand is the same missing `mkfs` work.
+
+They are kept because the tests are sound and only the fixture is
+missing. When `mkfs.xfs` exists, enable the feature and they should
+build unchanged.
+
+**So the honest status: the driver compiles and its logic is covered
+only where a fixture is not required.** Whether it mounts an XFS volume
+on Windows is untested and unclaimed.
 
 Finishing it means: thread `raw` through the read paths, drop the
 overlay/rebuild feature until mkfs.xfs exists, and decide whether the
