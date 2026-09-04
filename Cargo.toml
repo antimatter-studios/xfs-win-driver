@@ -26,7 +26,7 @@ clap = { version = "4", features = ["derive"] }
 # windows-only block.
 winfsp-fs-skeleton = { path = "../winfsp-fs-skeleton", default-features = false }
 am-fs-core = { path = "../rust-fs-core", version = "0.2" }
-am-fs-xfs = { path = "../rust-fs-xfs", version = "0.5" }
+am-fs-xfs = { path = "../rust-fs-xfs", version = "0.6" }
 # `watch` subcommand uses ctrlc on Windows. Pulled in unconditionally
 # (cheap, cross-platform) so the same handler code wires the foreground
 # `watch` and the WinFsp `mount` Ctrl-C path.
