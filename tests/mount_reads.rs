@@ -109,8 +109,13 @@ fn a_large_file_reads_back_at_the_right_offsets() {
     // Every 8-byte group must equal its own index. Checking the whole
     // file rather than samples: a driver that reads extents in the wrong
     // order gets most groups right and a few wrong.
-    for (index, chunk) in all.chunks_exact(8).enumerate() {
-        let value = u64::from_le_bytes(chunk.try_into().unwrap());
+    let (groups, tail) = all.as_chunks::<8>();
+    assert!(
+        tail.is_empty(),
+        "the file should be a whole number of groups"
+    );
+    for (index, chunk) in groups.iter().enumerate() {
+        let value = u64::from_le_bytes(*chunk);
         assert_eq!(
             value,
             index as u64,

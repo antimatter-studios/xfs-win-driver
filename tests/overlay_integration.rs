@@ -121,21 +121,125 @@ fn a_deleted_file_stops_resolving() {
     );
 }
 
+/// Renaming a file that exists ONLY in the underlay. This is the common
+/// case in practice and the one the first version of this test got
+/// wrong: it called `Overlay::rename`, which by design refuses a source
+/// it has no entry for, and the failure was the test's, not the
+/// driver's. `Mount::rename_path` is the operation that promotes from
+/// the underlay -- it used to live inside the `cfg(windows)` callback
+/// where no test here could reach it.
 #[test]
-fn a_rename_moves_the_file_within_the_overlay() {
-    let Some((m, _)) = open_fixture() else { return };
+fn renaming_an_underlay_file_carries_its_content() {
+    let Some((m, img)) = open_fixture() else {
+        return;
+    };
 
-    m.overlay
-        .rename(KNOWN_FILE, "/renamed.txt")
-        .expect("rename an underlay file through the overlay");
+    m.rename_path(KNOWN_FILE, "/renamed.txt", false)
+        .expect("rename a file that exists only in the image");
     assert_eq!(
         m.read_path("/renamed.txt").expect("read at the new name"),
         KNOWN_BYTES,
-        "the content should follow the rename"
+        "the content should be promoted out of the underlay, not lost"
     );
     assert!(
         m.read_path(KNOWN_FILE).is_err(),
         "the old name must stop resolving"
+    );
+
+    // And the image is untouched: the old name is still in it.
+    let untouched = mount(&img);
+    assert!(
+        untouched.open(KNOWN_FILE).is_ok(),
+        "renaming through the overlay must not modify the image"
+    );
+    assert!(
+        untouched.open("/renamed.txt").is_err(),
+        "the new name must not appear in the image"
+    );
+}
+
+/// A destination that already exists is refused unless the caller says
+/// to replace it -- the `replace_if_exists` flag WinFsp passes through.
+#[test]
+fn rename_onto_an_existing_name_needs_permission() {
+    let Some((m, _)) = open_fixture() else { return };
+
+    assert!(
+        m.rename_path(KNOWN_FILE, "/empty.txt", false).is_err(),
+        "clobbering an existing file must not be the default"
+    );
+    // The refusal left nothing staged: both names still read as before.
+    assert_eq!(m.read_path(KNOWN_FILE).expect("source intact"), KNOWN_BYTES);
+    assert_eq!(
+        m.read_path("/empty.txt").expect("destination intact"),
+        Vec::<u8>::new()
+    );
+
+    m.rename_path(KNOWN_FILE, "/empty.txt", true)
+        .expect("with permission it goes through");
+    assert_eq!(
+        m.read_path("/empty.txt").expect("read the replaced file"),
+        KNOWN_BYTES
+    );
+}
+
+/// A tombstoned destination is a free name. Checking the underlay
+/// without consulting the overlay first would see the deleted file and
+/// refuse -- resurrecting a name the caller had already removed.
+#[test]
+fn rename_onto_a_deleted_name_is_allowed() {
+    let Some((m, _)) = open_fixture() else { return };
+
+    m.overlay.delete("/empty.txt");
+    m.rename_path(KNOWN_FILE, "/empty.txt", false)
+        .expect("a tombstoned name is free even though the image still has it");
+    assert_eq!(m.read_path("/empty.txt").expect("read"), KNOWN_BYTES);
+}
+
+/// Renaming a file already staged in the overlay moves the staged
+/// bytes, not the underlay's.
+#[test]
+fn rename_moves_staged_content_not_underlay_content() {
+    let Some((m, _)) = open_fixture() else { return };
+
+    m.set_size_path(KNOWN_FILE, 0).expect("truncate");
+    m.write_path(KNOWN_FILE, 0, b"staged").expect("stage");
+    m.rename_path(KNOWN_FILE, "/moved.txt", false)
+        .expect("rename");
+
+    assert_eq!(
+        m.read_path("/moved.txt").expect("read"),
+        b"staged",
+        "the rename must carry the staged bytes, not re-read the image"
+    );
+}
+
+/// Renaming a path that is not there fails rather than staging an empty
+/// file at the destination.
+#[test]
+fn renaming_a_missing_path_stages_nothing() {
+    let Some((m, _)) = open_fixture() else { return };
+
+    assert!(m.rename_path("/not-here", "/somewhere", false).is_err());
+    assert!(
+        m.read_path("/somewhere").is_err(),
+        "a failed rename must not leave a destination behind"
+    );
+}
+
+/// Renaming to the same path is a no-op rather than a self-tombstone.
+/// Getting this wrong deletes the file: stage at `to`, then delete
+/// `from`, and when they are equal the delete wins.
+#[test]
+fn renaming_a_path_onto_itself_keeps_it() {
+    let Some((m, _)) = open_fixture() else { return };
+
+    m.rename_path(KNOWN_FILE, KNOWN_FILE, false)
+        .expect("a no-op rename succeeds");
+    assert_eq!(
+        m.read_path(KNOWN_FILE).expect("the file is still there"),
+        KNOWN_BYTES,
+        "renaming a path to itself must not delete it"
     );
 }
 

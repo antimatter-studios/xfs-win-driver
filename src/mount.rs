@@ -256,10 +256,11 @@ impl Mount {
     /// every read here is really two: resolve, then re-fetch.
     ///
     /// `lookup_path` has already read those bytes and discarded them,
-    /// which is the waste a handle-style API would remove (a `File`
-    /// would hold them from the lookup onward). Until that exists this
-    /// is one helper rather than the same three lines at five call
-    /// sites.
+    /// which is the waste `Filesystem::open` removes -- a `File` holds
+    /// the fork from the lookup onward. Callers that resolve a path and
+    /// then read it should use that instead. This helper stays for the
+    /// callers that already hold an `Inode` (the WinFsp context caches
+    /// one) and so have nothing left to open from.
     fn read_whole(&self, inode: &Inode) -> std::result::Result<Vec<u8>, &'static str> {
         let (inode, raw) = self
             .fs
@@ -351,6 +352,82 @@ impl Mount {
         };
         content.resize(new_size as usize, 0);
         self.overlay.write_file(unix_path, content, mode);
+        Ok(())
+    }
+
+    /// Rename `from` to `to`, staged entirely in the overlay.
+    ///
+    /// `Overlay::rename` deliberately refuses a source it has no entry
+    /// for -- it moves overlay state and knows nothing about the image.
+    /// Most renames a user performs are exactly that case, though: the
+    /// file exists only in the underlay and has never been written to.
+    /// So the source is read out of the image first and staged at the
+    /// destination, and the old path is tombstoned.
+    ///
+    /// A directory renames as an empty `CreatedDir`, which is a real
+    /// limitation and not an oversight: the children keep resolving at
+    /// their old paths through the underlay, so a renamed directory
+    /// appears empty. Recursive restaging is the fix, and it is not
+    /// written yet.
+    ///
+    /// This lived inside the `cfg(windows)` WinFsp `rename` callback,
+    /// where nothing off Windows could reach it -- so the one operation
+    /// with real underlay-to-overlay promotion logic was the one
+    /// operation with no portable test. The callback now calls this.
+    pub fn rename_path(
+        &self,
+        from: &str,
+        to: &str,
+        replace_if_exists: bool,
+    ) -> std::result::Result<(), &'static str> {
+        if from == to {
+            return Ok(());
+        }
+
+        // Resolve the source content, promoting from the underlay when
+        // the overlay has never seen it.
+        let (content, mode, is_dir) = match self.overlay.lookup(from) {
+            OverlayLookup::Hit(OverlayEntry::Created { content, mode, .. })
+            | OverlayLookup::Hit(OverlayEntry::Modified { content, mode, .. }) => {
+                (content, mode, false)
+            }
+            OverlayLookup::Hit(OverlayEntry::CreatedDir { mode, .. }) => (Vec::new(), mode, true),
+            OverlayLookup::Hit(OverlayEntry::Deleted) | OverlayLookup::Deleted => {
+                return Err("rename: source not found")
+            }
+            OverlayLookup::Miss => {
+                let inode = self
+                    .fs
+                    .lookup_path(from)
+                    .map_err(|_| "rename: source not found")?;
+                if inode.is_dir() {
+                    (Vec::new(), inode.mode, true)
+                } else if inode.is_regular_file() {
+                    (self.read_whole(&inode)?, inode.mode, false)
+                } else {
+                    return Err("rename: source is not a file or directory");
+                }
+            }
+        };
+
+        // A tombstone at the destination means it was deleted through
+        // the overlay, so the name is free even though the image still
+        // has it -- checking the underlay here would resurrect it.
+        let dest_exists = match self.overlay.lookup(to) {
+            OverlayLookup::Hit(OverlayEntry::Deleted) | OverlayLookup::Deleted => false,
+            OverlayLookup::Hit(_) => true,
+            OverlayLookup::Miss => self.fs.lookup_path(to).is_ok(),
+        };
+        if dest_exists && !replace_if_exists {
+            return Err("rename: destination exists");
+        }
+
+        if is_dir {
+            self.overlay.create_dir(to, mode);
+        } else {
+            self.overlay.create_file(to, content, mode);
+        }
+        self.overlay.delete(from);
         Ok(())
     }
 
@@ -1285,50 +1362,20 @@ mod winfsp_adapter {
             let from = winpath_to_unix(file_name).map_err(|_| STATUS_OBJECT_NAME_NOT_FOUND)?;
             let to = winpath_to_unix(new_file_name).map_err(|_| STATUS_OBJECT_NAME_NOT_FOUND)?;
 
-            // Resolve source content.
-            let (content, mode, is_dir) = match self.mount.overlay.lookup(&from) {
-                OverlayLookup::Hit(OverlayEntry::Created { content, mode, .. })
-                | OverlayLookup::Hit(OverlayEntry::Modified { content, mode, .. }) => {
-                    (content, mode, false)
-                }
-                OverlayLookup::Hit(OverlayEntry::CreatedDir { mode, .. }) => {
-                    (Vec::new(), mode, true)
-                }
-                // Same caveat as in read_full: `Hit(Deleted)` is
-                // type-reachable but `lookup` collapses it into the
-                // top-level `Deleted`. Either way the source is gone.
-                OverlayLookup::Hit(OverlayEntry::Deleted) | OverlayLookup::Deleted => {
-                    return Err(STATUS_OBJECT_NAME_NOT_FOUND.into());
-                }
-                OverlayLookup::Miss => {
-                    let inode = self.fs().lookup_path(&from).map_err(|e| err_to_status(e))?;
-                    if inode.is_dir() {
-                        (Vec::new(), inode.mode, true)
-                    } else if inode.is_regular_file() {
-                        (read_whole(self.fs(), &inode)?, inode.mode, false)
-                    } else {
-                        return Err(STATUS_INVALID_DEVICE_REQUEST.into());
-                    }
-                }
-            };
-
-            // Existence check at destination.
-            let dest_exists = match self.mount.overlay.lookup(&to) {
-                OverlayLookup::Hit(_) => true,
-                OverlayLookup::Deleted => false,
-                OverlayLookup::Miss => self.fs().lookup_path(&to).is_ok(),
-            };
-            if dest_exists && !replace_if_exists {
-                return Err(STATUS_OBJECT_NAME_COLLISION.into());
-            }
-
-            // Stage: create destination + tombstone source.
-            if is_dir {
-                self.mount.overlay.create_dir(&to, mode);
-            } else {
-                self.mount.overlay.create_file(&to, content, mode);
-            }
-            self.mount.overlay.delete(&from);
+            // The promotion logic used to live here, which put the one
+            // write operation that reads from the underlay out of reach
+            // of every non-Windows test. It is `Mount::rename_path` now;
+            // this maps its errors onto the statuses WinFsp expects.
+            self.mount
+                .rename_path(&from, &to, replace_if_exists)
+                .map_err(|e| match e {
+                    "rename: destination exists" => STATUS_OBJECT_NAME_COLLISION,
+                    // Same split `err_to_status` makes: a path problem
+                    // reads as not-found, anything else as a device
+                    // error. "underlay read error" lands in the second.
+                    "rename: source not found" => STATUS_OBJECT_NAME_NOT_FOUND,
+                    _ => STATUS_INVALID_DEVICE_REQUEST,
+                })?;
             Ok(())
         }
 

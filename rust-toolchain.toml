@@ -1,0 +1,19 @@
+[toolchain]
+# Pinned, and pinned to what CI was already running rather than to the
+# fs-* crates' 1.95.0.
+#
+# WHY THIS FILE EXISTS. Without it, CI installed floating `stable` while
+# this machine's default `stable` was four releases behind (1.98.1 vs
+# 1.94.1). A clippy lint added in between -- `chunks_exact` with a const
+# size -- fired in CI under `-D warnings` and could not be reproduced
+# locally. The build was not broken; the two toolchains were.
+#
+# WHY NOT 1.95.0. The fs-* readers pin that so a downstream FSKit build
+# links one std and one `_rust_eh_personality`. This crate links nothing
+# into that bundle -- it is a Windows binary that compiles am-fs-xfs from
+# source -- so it is free to sit on a newer compiler, and a dependency's
+# own rust-toolchain.toml is ignored anyway.
+#
+# Bump deliberately, after reading the new lint set.
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
