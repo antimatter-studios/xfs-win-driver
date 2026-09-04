@@ -921,15 +921,21 @@ mod winfsp_adapter {
             }
             let remaining = inode.size - offset;
             let take = (buffer.len() as u64).min(remaining) as usize;
-            // XFS's read_file has no offset form -- it returns the whole
-            // file -- so the range is taken here. Fine for an escape
-            // hatch; a driver serving large files would want the reader
-            // to grow a ranged read rather than paying this per call.
-            let whole = read_whole(self.fs(), &inode)?;
-            let from = offset as usize;
-            let end = (from + take).min(whole.len());
-            let n = end.saturating_sub(from);
-            buffer[..n].copy_from_slice(&whole[from..end]);
+            // `read_at` is the ranged read, and it is what this callback
+            // wants: WinFsp asks for a window, and this returns exactly
+            // that window. `read_file` is a thin wrapper over the same
+            // function with offset 0 -- reaching for it here would read
+            // the WHOLE FILE on every callback, which is O(size) per
+            // read and quadratic over a sequential scan.
+            //
+            // Holes and unwritten extents come back as zeros rather
+            // than stale disk contents, and a short return means end of
+            // file rather than an error.
+            let (inode, raw) = self.fs().read_inode_raw(inode.ino).map_err(err_to_status)?;
+            let n = self
+                .fs()
+                .read_at(&inode, &raw, offset, &mut buffer[..take])
+                .map_err(err_to_status)?;
             Ok(n as u32)
         }
 
