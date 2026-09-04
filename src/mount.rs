@@ -498,7 +498,7 @@ mod winfsp_adapter {
         DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, ModificationDescriptor,
         OpenFileInfo, VolumeInfo, WideNameInfo,
     };
-    use winfsp::host::{FileSystemHost, VolumeParams};
+    use winfsp::host::{FileSystemHost, FineGuard, VolumeParams};
     use winfsp::Result as FspResult;
     // FILE_FLAGS_AND_ATTRIBUTES from winfsp_sys is the bindgen u32
     // alias the FileSystemContext trait expects; the windows crate's
@@ -513,10 +513,6 @@ mod winfsp_adapter {
 
     use super::{Mount, OverlayEntry, OverlayLookup, WriteMode};
 
-    /// Seconds between Windows FILETIME epoch (1601-01-01) and Unix
-    /// epoch (1970-01-01).
-    const FILETIME_EPOCH_OFFSET_SEC: u64 = 11_644_473_600;
-
     /// IO_REPARSE_TAG_SYMLINK — Microsoft public symlink tag. We surface
     /// XFS symlinks as Windows reparse points so Explorer can render
     /// them (and follow them, with the right privilege). The literal is
@@ -524,17 +520,13 @@ mod winfsp_adapter {
     /// require an extra feature gate.
     const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
 
-    /// Convert a unix-epoch-seconds timestamp to a FILETIME (100-ns
-    /// intervals since 1601). Saturating on overflow — XFS stores
-    /// 64-bit seconds, FILETIME is 64-bit 100-ns ticks; for any
-    /// realistic mtime the multiplication fits comfortably.
-    fn unix_to_filetime(secs: u64, nsec: u32) -> u64 {
-        let secs_part = FILETIME_EPOCH_OFFSET_SEC
-            .saturating_add(secs)
-            .saturating_mul(10_000_000);
-        let nsec_part = (nsec as u64) / 100;
-        secs_part.saturating_add(nsec_part)
-    }
+    // The Unix-to-FILETIME conversion lives in winfsp-fs-skeleton.
+    // This module had the fourth copy of it in the family -- erofs and
+    // ext4 had two more, at three different widths between them -- and
+    // this one took `u64` seconds, which cannot even express XFS's
+    // `Timestamp.sec`. The shared one takes `i64`, so an XFS timestamp
+    // passes through unchanged and a date before 1970 survives.
+    use winfsp_fs_skeleton::translate::unix_to_filetime;
 
     /// `\foo\bar` (UTF-16) → `/foo/bar` (UTF-8). Empty path becomes "/".
     fn winpath_to_unix(name: &U16CStr) -> Result<String> {
@@ -581,12 +573,12 @@ mod winfsp_adapter {
         // Round allocation up to 4 KiB. XFS doesn't track on-disk
         // allocation distinct from logical size for our purposes.
         info.allocation_size = (inode.size + 4095) & !4095;
-        let ft = unix_to_filetime(inode.mtime, inode.mtime_nsec);
+        let ft = unix_to_filetime(inode.mtime.sec, inode.mtime.nsec);
         info.creation_time = ft;
         info.last_access_time = ft;
         info.last_write_time = ft;
         info.change_time = ft;
-        info.index_number = inode.nid;
+        info.index_number = inode.ino;
         info.hard_links = 0;
         info.ea_size = 0;
     }
@@ -610,7 +602,10 @@ mod winfsp_adapter {
         info.reparse_tag = 0;
         info.file_size = entry.content().map(|c| c.len() as u64).unwrap_or(0);
         info.allocation_size = (info.file_size + 4095) & !4095;
-        let ft = unix_to_filetime(entry.mtime(), 0);
+        // The overlay stamps entries with unsigned seconds; the shared
+        // converter takes signed. Checked rather than cast: `u64::MAX
+        // as i64` is -1, which would render as 1969.
+        let ft = unix_to_filetime(i64::try_from(entry.mtime()).unwrap_or(i64::MAX), 0);
         info.creation_time = ft;
         info.last_access_time = ft;
         info.last_write_time = ft;
@@ -983,7 +978,7 @@ mod winfsp_adapter {
                         ) {
                             continue;
                         }
-                        if let Ok(child) = self.fs().read_inode(e.nid) {
+                        if let Ok(child) = self.fs().read_inode(e.ino) {
                             underlay_pairs.push((name, child));
                         }
                     }
@@ -1453,7 +1448,10 @@ mod winfsp_adapter {
             params.read_only_volume(true);
         }
 
-        let mut host = FileSystemHost::new(params, ctx)
+        // Named rather than inferred: winfsp-rs 0.13.0 carries the
+        // locking strategy as a type parameter, and two impls' methods
+        // collide when it is left open -- E0034 at the mount() call.
+        let mut host = FileSystemHost::<_, FineGuard>::new(params, ctx)
             .map_err(|e| anyhow!("FileSystemHost::new failed: {e}"))?;
 
         host.mount(mount_point)
