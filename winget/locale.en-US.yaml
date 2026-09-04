@@ -1,0 +1,34 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+PackageIdentifier: AntimatterStudios.xfs-win-driver
+PackageVersion: 0.1.0
+PackageLocale: en-US
+Publisher: Antimatter Studios
+PublisherUrl: https://github.com/AntimatterStudios
+PublisherSupportUrl: https://github.com/AntimatterStudios/xfs-win-driver/issues
+PackageName: xfs-win-driver
+PackageUrl: https://github.com/AntimatterStudios/xfs-win-driver
+License: GPL-3.0-only
+LicenseUrl: https://www.gnu.org/licenses/gpl-3.0.html
+ShortDescription: Browse and auto-mount xfs disks on Windows via WinFsp.
+Description: |
+  xfs-win-driver is a Windows-first userspace driver for xfs volumes.
+  Plug an xfs SD card or USB stick into Windows and the bundled
+  XfsWatcher service mounts it on a free drive letter in the active
+  console session via WinFsp; detach and it unmounts cleanly. The
+  installer also wires a "Mount as xfs" right-click verb on .img
+  files for offline disk-image inspection, and ships a CLI for
+  browsing without mounting (info, ls, stat, cat, tree, parts, audit).
+
+  Setup.exe chains the WinFsp redistributable so end users only run
+  one installer. Read-write is the default mount mode; pass --ro to
+  the CLI or -ReadOnly to the right-click verb for safe inspection.
+Tags:
+  - xfs
+  - filesystem
+  - mount
+  - winfsp
+  - linux
+  - sd-card
+  - usb
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

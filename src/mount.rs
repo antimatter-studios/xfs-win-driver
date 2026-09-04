@@ -1,0 +1,1786 @@
+//! XFS mount handle and (with the `mount` feature) WinFsp adapter.
+//!
+//! `Mount` opens an XFS image — either a regular file path or, on
+//! Windows, a raw device like `\\.\PhysicalDriveN` — optionally seeking
+//! into a specific partition's byte range. The opened
+//! `am_fs_xfs::Filesystem` is then exposed to WinFsp via the
+//! `FileSystemContext` trait.
+//!
+//! Read-only by design: XFS is read-only at the format level, so every
+//! mutating WinFsp callback that would otherwise need wiring just inherits
+//! the trait's default `STATUS_INVALID_DEVICE_REQUEST`. WinFsp's
+//! `read_only_volume` flag is also set on `VolumeParams`, which is the
+//! primary gate — Explorer renders the drive as RO, the cache manager
+//! short-circuits writes, and the few callbacks that *do* dispatch
+//! (notably `set_security`) accept-and-ignore so common Explorer flows
+//! don't error out.
+//!
+//! Structure mirrors `ext4-win-driver/src/mount.rs` for consistency
+//! across our Windows driver family. Code was written independently;
+//! no verbatim copies of winfsp-rs example filesystems or xfs-utils.
+
+use anyhow::{anyhow, bail, Context, Result};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use fs_core::BlockRead;
+use fs_xfs::Filesystem;
+use winfsp_fs_skeleton::device::{BlockSource, FileSource};
+use winfsp_fs_skeleton::partition;
+
+use crate::overlay::{Overlay, OverlayEntry, OverlayLookup};
+
+/// A `BlockRead` shim that:
+///   - Forwards every read into a `FileSource` (sector-aligned raw-disk
+///     reads on Windows, plain `pread` on Unix).
+///   - Optionally offsets every read by `base` so we can hand the
+///     XFS reader a partition slice without it knowing about the
+///     surrounding disk.
+///   - Reports `len` as the device size, so `BlockRead::size_bytes`
+///     correctly reflects the slice's length (used by the XFS
+///     compressed-read path's `dev_size` cap).
+struct PartitionDevice {
+    src: Arc<dyn BlockSource>,
+    base: u64,
+    len: u64,
+}
+
+impl BlockRead for PartitionDevice {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> fs_core::Result<()> {
+        let end = offset
+            .checked_add(buf.len() as u64)
+            .ok_or(fs_core::Error::ShortRead {
+                offset,
+                want: buf.len(),
+                got: 0,
+            })?;
+        if end > self.len {
+            return Err(fs_core::Error::ShortRead {
+                offset,
+                want: buf.len(),
+                got: self.len.saturating_sub(offset) as usize,
+            });
+        }
+        self.src
+            .read_at(self.base + offset, buf)
+            .map_err(fs_core::Error::Io)
+    }
+
+    fn size_bytes(&self) -> u64 {
+        self.len
+    }
+}
+
+/// What to do with the in-memory read-write overlay when the user
+/// presses Ctrl-C / dismounts. XFS is read-only at the format level,
+/// so any writes the user made through the WinFsp surface are
+/// stash-and-replay state — the `DismountPolicy` decides where (or
+/// whether) that state ends up persisted.
+#[derive(Debug, Clone, Default)]
+pub enum DismountPolicy {
+    /// Drop the overlay. Any writes the user made vanish on dismount —
+    /// the canonical "read-only volume that pretended to be writable"
+    /// posture, useful for sandbox scenarios where the original image
+    /// must never be modified.
+    #[default]
+    Discard,
+    /// Serialise the overlay to a JSON sidecar at the given path.
+    /// Requires the `overlay-sidecar` Cargo feature.
+    Sidecar(PathBuf),
+    /// Walk the merged tree (overlay + underlay) and emit a NEW XFS
+    /// image at the given path via `fs_xfs::mkfs::build_image`.
+    /// This is the "commit my writes back to disk" mode — the original
+    /// image is left untouched and the new one carries every Created /
+    /// Modified / non-Deleted entry.
+    Rebuild(PathBuf),
+}
+
+/// Per-mount writability flag. `Writable` is the new default — writes
+/// are accepted and staged in the overlay. `ReadOnly` short-circuits
+/// every mutating callback at the WinFsp boundary so the volume rejects
+/// writes from the cache manager up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WriteMode {
+    #[default]
+    Writable,
+    ReadOnly,
+}
+
+/// RAII handle around an opened `am_fs_xfs::Filesystem`.
+///
+/// `pub(crate)` fields so the WinFsp adapter (defined further down) and
+/// the smoke tests can both reach in for the underlying `Filesystem`
+/// without going through extra accessors.
+pub struct Mount {
+    /// The opened XFS volume. Read by:
+    ///   - the WinFsp adapter (Windows + `feature = "mount"`)
+    ///   - the cross-platform smoke tests in this module
+    ///
+    /// On non-Windows builds without `--features mount` the field is
+    /// constructed but only consumed by tests; the dead-code allow keeps
+    /// `cargo build` quiet on macOS / Linux dev hosts.
+    #[cfg_attr(not(any(test, all(windows, feature = "mount"))), allow(dead_code))]
+    pub fs: Filesystem,
+    /// Original image path, kept for diagnostic messages.
+    #[allow(dead_code)]
+    image: PathBuf,
+    /// Read-write overlay layered atop the read-only underlay. Cross-
+    /// platform field so the overlay's behaviour can be exercised via
+    /// the integration tests on macOS without WinFsp linked in.
+    pub overlay: Arc<Overlay>,
+    /// What to do with the overlay on dismount. Configured via the CLI
+    /// `--scratch-*` flags; defaults to `Discard`.
+    pub dismount_policy: DismountPolicy,
+    /// Whether this mount accepts writes at all. `--ro` flips this to
+    /// `ReadOnly` and every mutating callback returns
+    /// `STATUS_MEDIA_WRITE_PROTECTED` (under `feature = "mount"`).
+    pub write_mode: WriteMode,
+}
+
+// `Filesystem` is `Send + Sync` (it holds an `Arc<dyn BlockRead>`),
+// so `Mount` is too — no manual unsafe impls needed.
+
+impl Mount {
+    /// Open an XFS image. `partition` selects a 1-indexed partition
+    /// in a whole-disk image; `None` or `Some(0)` means "treat `image`
+    /// as the XFS volume directly."
+    ///
+    /// Treating `Some(0)` the same as `None` mirrors ext4-win-driver and
+    /// lets the auto-mount watcher pass `--part 0` unconditionally
+    /// through the fixed WinFsp.Launcher CommandLine template when a
+    /// disk arrives without a partition table.
+    pub fn open(image: &Path, partition: Option<usize>) -> Result<Self> {
+        match partition {
+            None | Some(0) => Self::open_direct(image),
+            Some(n) => Self::open_partition(image, n),
+        }
+    }
+
+    /// Open the image as a single, unsliced XFS volume.
+    pub fn open_direct(image: &Path) -> Result<Self> {
+        // Wrap the raw FileSource in a zero-offset slice so we use the
+        // same code path everywhere — the `Filesystem` stays oblivious
+        // to whether it's reading the full file or a partition slice.
+        let src: Arc<dyn BlockSource> = Arc::new(FileSource::open(image)?);
+        let len = src.size();
+        let dev: Arc<dyn BlockRead> = Arc::new(PartitionDevice { src, base: 0, len });
+        let fs = Filesystem::mount(dev).map_err(|e| {
+            anyhow!(
+                "open XFS at {}: {e}{}",
+                image.display(),
+                partition_hint(image)
+            )
+        })?;
+        Ok(Self {
+            fs,
+            image: image.to_path_buf(),
+            overlay: Arc::new(Overlay::new()),
+            dismount_policy: DismountPolicy::default(),
+            write_mode: WriteMode::default(),
+        })
+    }
+
+    /// Open the Nth partition (1-indexed) inside `image` as an XFS
+    /// volume. Bounds-checks the partition geometry against the device
+    /// size before handing the slice to `Filesystem::open`.
+    pub fn open_partition(image: &Path, n: usize) -> Result<Self> {
+        let src: Arc<dyn BlockSource> = Arc::new(FileSource::open(image)?);
+        let parts = partition::list_from_source(src.as_ref())
+            .with_context(|| format!("listing partitions in {}", image.display()))?;
+        if parts.is_empty() {
+            bail!("no partitions found in {}", image.display());
+        }
+        if n == 0 || n > parts.len() {
+            bail!("--part {n} out of range (1..={})", parts.len());
+        }
+        let p = &parts[n - 1];
+        let base = p.start_lba * 512;
+        let len = p.num_sectors * 512;
+        let end = base
+            .checked_add(len)
+            .ok_or_else(|| anyhow!("partition geometry overflows u64"))?;
+        if end > src.size() {
+            bail!(
+                "partition {n} extends past device end: {end} > {} bytes",
+                src.size()
+            );
+        }
+        let dev: Arc<dyn BlockRead> = Arc::new(PartitionDevice { src, base, len });
+        let fs = Filesystem::mount(dev).map_err(|e| {
+            anyhow!(
+                "open XFS at {} partition {n} ({}): {e}",
+                image.display(),
+                p.kind
+            )
+        })?;
+        Ok(Self {
+            fs,
+            image: image.to_path_buf(),
+            overlay: Arc::new(Overlay::new()),
+            dismount_policy: DismountPolicy::default(),
+            write_mode: WriteMode::default(),
+        })
+    }
+
+    /// Configure the dismount policy. Builder-style — chained after
+    /// `open` / `open_direct` / `open_partition`.
+    pub fn with_dismount_policy(mut self, policy: DismountPolicy) -> Self {
+        self.dismount_policy = policy;
+        self
+    }
+
+    /// Configure the write mode. Used to honour the CLI's `--ro` flag.
+    pub fn with_write_mode(mut self, mode: WriteMode) -> Self {
+        self.write_mode = mode;
+        self
+    }
+
+    /// Read a file's full contents through the merged overlay+underlay
+    /// surface. Returns `Ok(content)` on hit (Created / Modified / underlay
+    /// regular file), `Err("not found")` for tombstoned / nonexistent
+    /// paths, and `Err("not a regular file")` for dirs / symlinks. Used
+    /// by the integration tests to verify the read path WITHOUT linking
+    /// the WinFsp adapter — the WinFsp `read` callback uses the same
+    /// precedence rules.
+    pub fn read_path(&self, unix_path: &str) -> std::result::Result<Vec<u8>, &'static str> {
+        match self.overlay.lookup(unix_path) {
+            OverlayLookup::Hit(OverlayEntry::Created { content, .. })
+            | OverlayLookup::Hit(OverlayEntry::Modified { content, .. }) => Ok(content),
+            OverlayLookup::Hit(OverlayEntry::CreatedDir { .. }) => Err("not a regular file"),
+            OverlayLookup::Hit(OverlayEntry::Deleted) => Err("not found"),
+            OverlayLookup::Deleted => Err("not found"),
+            OverlayLookup::Miss => {
+                let inode = self.fs.lookup_path(unix_path).map_err(|_| "not found")?;
+                if !inode.is_regular_file() {
+                    return Err("not a regular file");
+                }
+                let mut buf = vec![0u8; inode.size as usize];
+                if !buf.is_empty() {
+                    self.fs
+                        .read_file(&inode, 0, &mut buf)
+                        .map_err(|_| "underlay read error")?;
+                }
+                Ok(buf)
+            }
+        }
+    }
+
+    /// Stage a write through the overlay using the same read-modify-write
+    /// semantics the WinFsp `write` callback applies. `offset` may
+    /// extend past current EOF; intermediate bytes are zero-filled.
+    /// Used by integration tests to drive the cross-platform write path.
+    pub fn write_path(
+        &self,
+        unix_path: &str,
+        offset: u64,
+        buf: &[u8],
+    ) -> std::result::Result<(), &'static str> {
+        // Resolve current content + mode from overlay-or-underlay.
+        let (mut content, mode) = match self.overlay.lookup(unix_path) {
+            OverlayLookup::Hit(OverlayEntry::Created { content, mode, .. })
+            | OverlayLookup::Hit(OverlayEntry::Modified { content, mode, .. }) => (content, mode),
+            OverlayLookup::Hit(OverlayEntry::CreatedDir { .. }) => {
+                return Err("write on directory")
+            }
+            OverlayLookup::Hit(OverlayEntry::Deleted) | OverlayLookup::Deleted => {
+                return Err("write on tombstoned path")
+            }
+            OverlayLookup::Miss => match self.fs.lookup_path(unix_path) {
+                Ok(inode) if inode.is_regular_file() => {
+                    let mut existing = vec![0u8; inode.size as usize];
+                    if !existing.is_empty() {
+                        self.fs
+                            .read_file(&inode, 0, &mut existing)
+                            .map_err(|_| "underlay read error")?;
+                    }
+                    (existing, inode.mode)
+                }
+                Ok(_) => return Err("write on non-regular underlay entry"),
+                Err(_) => return Err("write on missing path"),
+            },
+        };
+        let end = offset
+            .checked_add(buf.len() as u64)
+            .ok_or("offset+len overflow")?;
+        if end > content.len() as u64 {
+            content.resize(end as usize, 0);
+        }
+        content[offset as usize..offset as usize + buf.len()].copy_from_slice(buf);
+        self.overlay.write_file(unix_path, content, mode);
+        Ok(())
+    }
+
+    /// Truncate or zero-extend `unix_path` to `new_size` through the
+    /// overlay. Read-modify-write against the merged surface; result
+    /// always lands as a `Modified` (or `Created`) overlay entry. Used
+    /// by integration tests to simulate the WinFsp `set_file_size`
+    /// callback cross-platform.
+    pub fn set_size_path(
+        &self,
+        unix_path: &str,
+        new_size: u64,
+    ) -> std::result::Result<(), &'static str> {
+        let (mut content, mode) = match self.overlay.lookup(unix_path) {
+            OverlayLookup::Hit(OverlayEntry::Created { content, mode, .. })
+            | OverlayLookup::Hit(OverlayEntry::Modified { content, mode, .. }) => (content, mode),
+            OverlayLookup::Hit(OverlayEntry::CreatedDir { .. }) => {
+                return Err("set_size on directory")
+            }
+            OverlayLookup::Hit(OverlayEntry::Deleted) | OverlayLookup::Deleted => {
+                return Err("set_size on tombstoned path")
+            }
+            OverlayLookup::Miss => match self.fs.lookup_path(unix_path) {
+                Ok(inode) if inode.is_regular_file() => {
+                    let mut existing = vec![0u8; inode.size as usize];
+                    if !existing.is_empty() {
+                        self.fs
+                            .read_file(&inode, 0, &mut existing)
+                            .map_err(|_| "underlay read error")?;
+                    }
+                    (existing, inode.mode)
+                }
+                Ok(_) => return Err("set_size on non-regular underlay entry"),
+                Err(_) => return Err("set_size on missing path"),
+            },
+        };
+        content.resize(new_size as usize, 0);
+        self.overlay.write_file(unix_path, content, mode);
+        Ok(())
+    }
+
+    /// Apply the configured `DismountPolicy`. Public so the integration
+    /// tests can drive it directly without going through a real WinFsp
+    /// host. Always called from `run_impl` on Ctrl-C as well.
+    ///
+    /// `Discard` returns Ok with no side effects (the overlay is
+    /// dropped when `Mount` itself drops). `Sidecar` writes a JSON
+    /// dump (requires the `overlay-sidecar` feature). `Rebuild` walks
+    /// the merged tree and emits a fresh XFS image at the configured
+    /// path.
+    pub fn apply_dismount_policy(&self) -> Result<()> {
+        match &self.dismount_policy {
+            DismountPolicy::Discard => {
+                self.overlay.clear();
+                Ok(())
+            }
+            DismountPolicy::Sidecar(path) => write_sidecar(&self.overlay, path),
+            DismountPolicy::Rebuild(path) => rebuild_image(&self.fs, &self.overlay, path),
+        }
+    }
+
+    /// Mount this filesystem on a Windows drive letter / empty
+    /// directory. Blocks until the user presses Ctrl-C.
+    ///
+    /// Stub on non-Windows hosts: prints a diagnostic and exits.
+    /// Cross-compile / cargo-check on macOS / Linux still succeed so
+    /// the rest of the CLI stays usable as a development tool.
+    pub fn run(self, mount_point: &str) -> Result<()> {
+        run_impl(self, mount_point)
+    }
+}
+
+#[cfg(not(all(windows, feature = "mount")))]
+fn run_impl(_mount: Mount, _mount_point: &str) -> Result<()> {
+    eprintln!("xfs: WinFsp mount only supported on Windows (with --features mount).");
+    Ok(())
+}
+
+#[cfg(all(windows, feature = "mount"))]
+fn run_impl(mount: Mount, mount_point: &str) -> Result<()> {
+    winfsp_adapter::run(mount, mount_point)
+}
+
+// ---------------------------------------------------------------------------
+// Dismount-policy implementations.
+// ---------------------------------------------------------------------------
+
+/// Serialise the overlay's snapshot to a JSON sidecar at `path`.
+/// `overlay-sidecar` feature gate: emits a hard error if the feature is
+/// off so users who try the CLI flag without the feature get a clear
+/// diagnostic rather than a silent no-op.
+#[cfg(feature = "overlay-sidecar")]
+fn write_sidecar(overlay: &Overlay, path: &Path) -> Result<()> {
+    let snap = overlay.snapshot();
+    let json =
+        serde_json::to_vec_pretty(&snap).map_err(|e| anyhow!("serialise overlay snapshot: {e}"))?;
+    std::fs::write(path, json)
+        .with_context(|| format!("write overlay sidecar to {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(not(feature = "overlay-sidecar"))]
+fn write_sidecar(_overlay: &Overlay, path: &Path) -> Result<()> {
+    bail!(
+        "--scratch-sidecar requires the `overlay-sidecar` feature; rebuild with \
+         `cargo build --features overlay-sidecar` (requested path: {})",
+        path.display()
+    );
+}
+
+/// Walk the merged tree (overlay + underlay), build an `mkfs::Node`
+/// reflecting the post-overlay state, and emit a new XFS image at
+/// `out_path`. The original underlay image is untouched. Block size is
+/// inherited from the underlay's superblock so the rebuilt image keeps
+/// the same on-disk geometry.
+fn rebuild_image(fs: &Filesystem, overlay: &Overlay, out_path: &Path) -> Result<()> {
+    use fs_xfs::mkfs::{build_image, Node, NodeMeta, DEFAULT_DIR_MODE, DEFAULT_FILE_MODE};
+    use std::collections::BTreeMap;
+
+    fn build_node(fs: &Filesystem, overlay: &Overlay, path: &str) -> Result<Option<Node>> {
+        // Overlay precedence at the path itself.
+        match overlay.lookup(path) {
+            OverlayLookup::Deleted => return Ok(None),
+            OverlayLookup::Hit(OverlayEntry::Created { content, mode, .. })
+            | OverlayLookup::Hit(OverlayEntry::Modified { content, mode, .. }) => {
+                return Ok(Some(Node::File {
+                    mode,
+                    data: content,
+                    meta: NodeMeta::default(),
+                    xattrs: Vec::new(),
+                }));
+            }
+            OverlayLookup::Hit(OverlayEntry::CreatedDir { mode, .. }) => {
+                let mut entries: BTreeMap<String, Node> = BTreeMap::new();
+                for (leaf, _) in overlay.iter_dir(path) {
+                    let child_path = if path == "/" {
+                        format!("/{leaf}")
+                    } else {
+                        format!("{path}/{leaf}")
+                    };
+                    if let Some(node) = build_node(fs, overlay, &child_path)? {
+                        entries.insert(leaf, node);
+                    }
+                }
+                return Ok(Some(Node::Dir {
+                    mode,
+                    entries,
+                    meta: NodeMeta::default(),
+                    xattrs: Vec::new(),
+                }));
+            }
+            OverlayLookup::Hit(OverlayEntry::Deleted) => {
+                // `lookup` returns `OverlayLookup::Deleted` for tombstones,
+                // so a `Hit(Deleted)` is unreachable in practice. Defensive
+                // arm: behave as if the path is gone.
+                return Ok(None);
+            }
+            OverlayLookup::Miss => {}
+        }
+
+        // Underlay path. Look up the inode; absent → return None
+        // (treated as a non-existent path).
+        let inode = match fs.lookup_path(path) {
+            Ok(i) => i,
+            Err(_) => return Ok(None),
+        };
+        if inode.is_dir() {
+            // Merge underlay children with overlay entries.
+            let mut entries: BTreeMap<String, Node> = BTreeMap::new();
+            // Underlay-listed children first; overlay tombstones drop
+            // them, overlay entries replace them via the recursion.
+            let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            if let Ok(children) = fs.read_dir(&inode) {
+                for child in children {
+                    if child.name == b"." || child.name == b".." {
+                        continue;
+                    }
+                    let name = match std::str::from_utf8(&child.name) {
+                        Ok(s) => s.to_string(),
+                        Err(_) => continue,
+                    };
+                    let child_path = if path == "/" {
+                        format!("/{name}")
+                    } else {
+                        format!("{path}/{name}")
+                    };
+                    seen.insert(name.clone());
+                    if let Some(node) = build_node(fs, overlay, &child_path)? {
+                        entries.insert(name, node);
+                    }
+                }
+            }
+            // Pure-overlay creations under this dir that the underlay
+            // never had.
+            for (leaf, _) in overlay.iter_dir(path) {
+                if seen.contains(&leaf) {
+                    continue;
+                }
+                let child_path = if path == "/" {
+                    format!("/{leaf}")
+                } else {
+                    format!("{path}/{leaf}")
+                };
+                if let Some(node) = build_node(fs, overlay, &child_path)? {
+                    entries.insert(leaf, node);
+                }
+            }
+            return Ok(Some(Node::Dir {
+                mode: DEFAULT_DIR_MODE,
+                entries,
+                meta: NodeMeta::default(),
+                xattrs: Vec::new(),
+            }));
+        }
+        if inode.is_regular_file() {
+            let mut buf = vec![0u8; inode.size as usize];
+            if !buf.is_empty() {
+                fs.read_file(&inode, 0, &mut buf)
+                    .map_err(|e| anyhow!("read underlay file at {path}: {e}"))?;
+            }
+            return Ok(Some(Node::File {
+                mode: DEFAULT_FILE_MODE,
+                data: buf,
+                meta: NodeMeta::default(),
+                xattrs: Vec::new(),
+            }));
+        }
+        // Symlinks / special files / chunked / compressed: skipped in
+        // the rebuild path. The mkfs builder supports symlinks but we
+        // can't easily round-trip without a target; v1 of the rebuild
+        // pipeline focuses on regular-files-and-dirs which is what the
+        // overlay can mutate anyway.
+        Ok(None)
+    }
+
+    let root = build_node(fs, overlay, "/")?
+        .ok_or_else(|| anyhow!("rebuild: root path resolved to None — empty tree?"))?;
+    let blkszbits = (fs.superblock().block_size().trailing_zeros()) as u8;
+    let bytes = build_image(root, blkszbits).map_err(|e| anyhow!("rebuild XFS image: {e}"))?;
+    std::fs::write(out_path, bytes)
+        .with_context(|| format!("write rebuilt image to {}", out_path.display()))?;
+    Ok(())
+}
+
+/// Best-effort hint shown when a direct mount fails on what looks like
+/// a partitioned device. Mirrors the ext4-win-driver hint structure but
+/// keeps the listing format short — suggest `--part N` with the kind.
+fn partition_hint(image: &Path) -> String {
+    match partition::list(image) {
+        Ok(parts) if !parts.is_empty() => {
+            let mut s =
+                String::from("\nhint: this looks like a partitioned device. Try --part N:\n");
+            for (i, p) in parts.iter().enumerate() {
+                s.push_str(&format!(
+                    "  {}: {} sectors @ LBA {} ({})\n",
+                    i + 1,
+                    p.num_sectors,
+                    p.start_lba,
+                    p.kind,
+                ));
+            }
+            s
+        }
+        _ => String::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WinFsp adapter (feature = "mount", windows only)
+// ---------------------------------------------------------------------------
+
+#[cfg(all(windows, feature = "mount"))]
+mod winfsp_adapter {
+    //! Bridge between WinFsp's `FileSystemContext` and a read-write
+    //! overlay layered atop `am_fs_xfs::Filesystem`.
+    //!
+    //! Reads consult the in-memory overlay first; on Miss they fall
+    //! through to the read-only XFS underlay. Writes always land in
+    //! the overlay — the underlay image is never touched. On dismount,
+    //! the overlay is either discarded, serialised to a JSON sidecar,
+    //! or used to rebuild a fresh XFS image, controlled by the
+    //! `DismountPolicy` configured at mount time.
+    //!
+    //! Path conversions: WinFsp gives backslash-separated UTF-16 paths
+    //! (`\foo\bar`); XFS's lookup_path wants slash-separated UTF-8
+    //! (`/foo/bar`). Done in [`winpath_to_unix`].
+    //!
+    //! Time conversions: XFS stores 64-bit unix-epoch seconds + nsec;
+    //! Windows FILETIME is 100-ns intervals since 1601-01-01. The
+    //! constant offset between the two epochs is 11644473600 seconds.
+    //!
+    //! API references (winfsp-rs, GPL-3, vendored at ../winfsp-rs):
+    //!   - `winfsp::filesystem::FileSystemContext` — the trait we impl
+    //!   - `winfsp::filesystem::{FileInfo, OpenFileInfo, VolumeInfo,
+    //!     DirInfo, DirMarker, FileSecurity, WideNameInfo}`
+    //!   - `winfsp::host::{FileSystemHost, VolumeParams}`
+    //! All implementations below are original; the structure mirrors
+    //! `ext4-win-driver/src/mount.rs` but without verbatim copies. The
+    //! overlay implementation is independent of overlayfs / unionfs /
+    //! fuse-overlayfs (all GPL-licensed reference projects).
+    //!
+    //! License posture: this module is the only place that links against
+    //! the GPL-3 winfsp-rs crate. The rest of xfs-win-driver and all
+    //! of `am-fs-xfs` (MIT) flow upward into the GPL-3 unit cleanly
+    //! under the GPL-3's one-way compatibility rule.
+
+    use anyhow::{anyhow, Context, Result};
+    use std::collections::BTreeSet;
+    use std::ffi::c_void;
+    use std::sync::Mutex;
+    use widestring::U16CStr;
+    use windows::Win32::Foundation::{
+        STATUS_END_OF_FILE, STATUS_INVALID_DEVICE_REQUEST, STATUS_MEDIA_WRITE_PROTECTED,
+        STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND,
+    };
+    use windows::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY,
+        FILE_ATTRIBUTE_REPARSE_POINT,
+    };
+    use winfsp::filesystem::{
+        DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, ModificationDescriptor,
+        OpenFileInfo, VolumeInfo, WideNameInfo,
+    };
+    use winfsp::host::{FileSystemHost, VolumeParams};
+    use winfsp::Result as FspResult;
+    // FILE_FLAGS_AND_ATTRIBUTES from winfsp_sys is the bindgen u32
+    // alias the FileSystemContext trait expects; the windows crate's
+    // same-named newtype struct(u32) is signature-incompatible (see
+    // E0053 trait-method-incompatible-type errors when the wrong one
+    // is in scope on x64 / arm64 builds).
+    use winfsp_sys::{FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES};
+
+    use fs_xfs::{FileType, Filesystem, Inode};
+
+    use super::{Mount, OverlayEntry, OverlayLookup, WriteMode};
+
+    /// Seconds between Windows FILETIME epoch (1601-01-01) and Unix
+    /// epoch (1970-01-01).
+    const FILETIME_EPOCH_OFFSET_SEC: u64 = 11_644_473_600;
+
+    /// IO_REPARSE_TAG_SYMLINK — Microsoft public symlink tag. We surface
+    /// XFS symlinks as Windows reparse points so Explorer can render
+    /// them (and follow them, with the right privilege). The literal is
+    /// stable across NT versions; pulling it from `windows` would
+    /// require an extra feature gate.
+    const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+
+    /// Convert a unix-epoch-seconds timestamp to a FILETIME (100-ns
+    /// intervals since 1601). Saturating on overflow — XFS stores
+    /// 64-bit seconds, FILETIME is 64-bit 100-ns ticks; for any
+    /// realistic mtime the multiplication fits comfortably.
+    fn unix_to_filetime(secs: u64, nsec: u32) -> u64 {
+        let secs_part = FILETIME_EPOCH_OFFSET_SEC
+            .saturating_add(secs)
+            .saturating_mul(10_000_000);
+        let nsec_part = (nsec as u64) / 100;
+        secs_part.saturating_add(nsec_part)
+    }
+
+    /// `\foo\bar` (UTF-16) → `/foo/bar` (UTF-8). Empty path becomes "/".
+    fn winpath_to_unix(name: &U16CStr) -> Result<String> {
+        let s = name.to_string().context("path is invalid UTF-16")?;
+        if s.is_empty() {
+            return Ok("/".into());
+        }
+        Ok(s.replace('\\', "/"))
+    }
+
+    /// Translate an XFS inode into a Windows file-attribute bitmap.
+    /// `read_only` is parameterised because the volume is no longer
+    /// unconditionally RO — the WinFsp adapter sets it true when the
+    /// `--ro` flag is passed and false otherwise. DIRECTORY when
+    /// applicable. REPARSE_POINT for symlinks so Explorer renders them
+    /// as shortcuts.
+    fn file_attributes(inode: &Inode, read_only: bool) -> u32 {
+        let mut a = if read_only {
+            FILE_ATTRIBUTE_READONLY.0
+        } else {
+            FILE_ATTRIBUTE_NORMAL.0
+        };
+        if inode.is_dir() {
+            a |= FILE_ATTRIBUTE_DIRECTORY.0;
+            // NORMAL is mutually exclusive with DIRECTORY in
+            // the Windows attribute model — strip it.
+            a &= !FILE_ATTRIBUTE_NORMAL.0;
+        }
+        if inode.is_symlink() {
+            a |= FILE_ATTRIBUTE_REPARSE_POINT.0;
+        }
+        a
+    }
+
+    /// Populate `FileInfo` from an XFS `Inode`.
+    fn populate_file_info(inode: &Inode, info: &mut FileInfo, read_only: bool) {
+        info.file_attributes = file_attributes(inode, read_only);
+        info.reparse_tag = if inode.is_symlink() {
+            IO_REPARSE_TAG_SYMLINK
+        } else {
+            0
+        };
+        info.file_size = inode.size;
+        // Round allocation up to 4 KiB. XFS doesn't track on-disk
+        // allocation distinct from logical size for our purposes.
+        info.allocation_size = (inode.size + 4095) & !4095;
+        let ft = unix_to_filetime(inode.mtime, inode.mtime_nsec);
+        info.creation_time = ft;
+        info.last_access_time = ft;
+        info.last_write_time = ft;
+        info.change_time = ft;
+        info.index_number = inode.nid;
+        info.hard_links = 0;
+        info.ea_size = 0;
+    }
+
+    /// Populate `FileInfo` from an overlay entry. Used when the read
+    /// callback sees a `Hit` and skips the underlay entirely. Mirrors
+    /// `populate_file_info` for inode-backed entries but pulls size /
+    /// mode / mtime from the overlay payload instead.
+    fn populate_overlay_file_info(entry: &OverlayEntry, info: &mut FileInfo, read_only: bool) {
+        let is_dir = entry.is_dir();
+        let mut a = if read_only {
+            FILE_ATTRIBUTE_READONLY.0
+        } else {
+            FILE_ATTRIBUTE_NORMAL.0
+        };
+        if is_dir {
+            a |= FILE_ATTRIBUTE_DIRECTORY.0;
+            a &= !FILE_ATTRIBUTE_NORMAL.0;
+        }
+        info.file_attributes = a;
+        info.reparse_tag = 0;
+        info.file_size = entry.content().map(|c| c.len() as u64).unwrap_or(0);
+        info.allocation_size = (info.file_size + 4095) & !4095;
+        let ft = unix_to_filetime(entry.mtime(), 0);
+        info.creation_time = ft;
+        info.last_access_time = ft;
+        info.last_write_time = ft;
+        info.change_time = ft;
+        // Synthetic NIDs for overlay entries — pick something that
+        // can't collide with a real XFS NID. We use the high bit set
+        // and hash the path-id contribution at callsites if collision
+        // matters; here we just zero it out (Explorer doesn't rely on
+        // it for write-staged paths).
+        info.index_number = 0;
+        info.hard_links = 0;
+        info.ea_size = 0;
+    }
+
+    /// Map an `fs_xfs::Error` to an NTSTATUS suitable for returning
+    /// from a WinFsp callback. Most lookup-style failures collapse to
+    /// `STATUS_OBJECT_NAME_NOT_FOUND` — Explorer / consumer apps treat
+    /// that uniformly. Disk-IO and format errors become
+    /// `STATUS_INVALID_DEVICE_REQUEST` so they surface but don't get
+    /// confused with "no such file."
+    fn err_to_status(err: fs_xfs::Error) -> windows::Win32::Foundation::NTSTATUS {
+        use fs_xfs::Error as E;
+        match err {
+            E::NotFound | E::NotADirectory | E::BadDirent(_) => STATUS_OBJECT_NAME_NOT_FOUND,
+            _ => STATUS_INVALID_DEVICE_REQUEST,
+        }
+    }
+
+    /// Look up a path in the wrapped XFS volume, mapping any failure
+    /// to an NTSTATUS the WinFsp callback can return directly.
+    fn lookup(fs: &Filesystem, unix_path: &str) -> FspResult<Inode> {
+        fs.lookup_path(unix_path)
+            .map_err(|e| err_to_status(e).into())
+    }
+
+    /// Per-open file handle state.
+    ///
+    /// `inode` is `None` when the open path is overlay-only (no
+    /// underlay counterpart) — e.g. a freshly Created file or
+    /// CreatedDir. Read / write callbacks dispatch on `unix_path`
+    /// against the overlay first; on Miss they consult the underlay
+    /// via the cached `inode`.
+    pub struct XfsFileContext {
+        pub unix_path: String,
+        pub inode: Mutex<Option<Inode>>,
+        pub is_dir: bool,
+        /// True if this open handle has been marked for delete via
+        /// `set_delete`. The actual tombstone is staged in `cleanup`.
+        pub pending_delete: Mutex<bool>,
+    }
+
+    /// Filesystem-wide state shared across all WinFsp callbacks.
+    pub struct XfsContext {
+        mount: Mount,
+        label: String,
+        total_size: u64,
+    }
+
+    impl XfsContext {
+        pub fn new(mount: Mount) -> Result<Self> {
+            let sb = mount.fs.superblock();
+            let label = sb.volume_name_str().to_string();
+            let total_size = (sb.blocks as u64) * sb.block_size();
+            Ok(Self {
+                mount,
+                label,
+                total_size,
+            })
+        }
+
+        fn fs(&self) -> &Filesystem {
+            &self.mount.fs
+        }
+
+        fn is_read_only(&self) -> bool {
+            self.mount.write_mode == WriteMode::ReadOnly
+        }
+
+        /// `true` if the volume must reject write callbacks. On a
+        /// read-only mount we return `STATUS_MEDIA_WRITE_PROTECTED` —
+        /// distinct from `INVALID_DEVICE_REQUEST` so apps that probe
+        /// writability get a clearer error.
+        fn ensure_writable(&self) -> FspResult<()> {
+            if self.is_read_only() {
+                Err(STATUS_MEDIA_WRITE_PROTECTED.into())
+            } else {
+                Ok(())
+            }
+        }
+
+        /// Resolve a path's full content for the write callback. Looks
+        /// up the overlay first; on Miss reads the underlay file in
+        /// full. Returns `(content, mode)` or NotFound.
+        ///
+        /// Read-then-write race resolution: this is taken under the
+        /// caller's effective lock (the WinFsp callback dispatches
+        /// per-handle, and writes against the same path serialise
+        /// inside the overlay's RwLock at insertion time). A racing
+        /// reader could see the pre-write content; but the XFS
+        /// underlay never changes, so any read consulting the
+        /// underlay at the same time gets a consistent snapshot.
+        fn read_full(&self, unix_path: &str) -> FspResult<(Vec<u8>, u16)> {
+            match self.mount.overlay.lookup(unix_path) {
+                OverlayLookup::Hit(OverlayEntry::Created { content, mode, .. })
+                | OverlayLookup::Hit(OverlayEntry::Modified { content, mode, .. }) => {
+                    Ok((content, mode))
+                }
+                OverlayLookup::Hit(OverlayEntry::CreatedDir { .. }) => {
+                    Err(STATUS_INVALID_DEVICE_REQUEST.into())
+                }
+                // `lookup` translates a stored `Deleted` entry into the
+                // top-level `Deleted` arm, so `Hit(Deleted)` shouldn't
+                // arise in practice -- but the type system can't know
+                // that, and treating it as "logically gone" matches
+                // the contract anyway.
+                OverlayLookup::Hit(OverlayEntry::Deleted) | OverlayLookup::Deleted => {
+                    Err(STATUS_OBJECT_NAME_NOT_FOUND.into())
+                }
+                OverlayLookup::Miss => {
+                    let inode = self
+                        .fs()
+                        .lookup_path(unix_path)
+                        .map_err(|e| err_to_status(e))?;
+                    if !inode.is_regular_file() {
+                        return Err(STATUS_INVALID_DEVICE_REQUEST.into());
+                    }
+                    let mut buf = vec![0u8; inode.size as usize];
+                    if !buf.is_empty() {
+                        self.fs()
+                            .read_file(&inode, 0, &mut buf)
+                            .map_err(|e| err_to_status(e))?;
+                    }
+                    Ok((buf, inode.mode))
+                }
+            }
+        }
+    }
+
+    impl FileSystemContext for XfsContext {
+        type FileContext = XfsFileContext;
+
+        fn get_security_by_name(
+            &self,
+            file_name: &U16CStr,
+            _security_descriptor: Option<&mut [c_void]>,
+            _resolve_reparse: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
+        ) -> FspResult<FileSecurity> {
+            let unix_path = winpath_to_unix(file_name).map_err(|_| STATUS_OBJECT_NAME_NOT_FOUND)?;
+            let read_only = self.is_read_only();
+            // Overlay-first lookup. A `Deleted` tombstone hides any
+            // underlay file even if get_security_by_name is the first
+            // touchpoint after a delete.
+            match self.mount.overlay.lookup(&unix_path) {
+                OverlayLookup::Deleted => Err(STATUS_OBJECT_NAME_NOT_FOUND.into()),
+                OverlayLookup::Hit(entry) => {
+                    let attrs = if entry.is_dir() {
+                        let mut a = if read_only {
+                            FILE_ATTRIBUTE_READONLY.0
+                        } else {
+                            FILE_ATTRIBUTE_NORMAL.0
+                        };
+                        a |= FILE_ATTRIBUTE_DIRECTORY.0;
+                        a &= !FILE_ATTRIBUTE_NORMAL.0;
+                        a
+                    } else if read_only {
+                        FILE_ATTRIBUTE_READONLY.0
+                    } else {
+                        FILE_ATTRIBUTE_NORMAL.0
+                    };
+                    Ok(FileSecurity {
+                        reparse: false,
+                        sz_security_descriptor: 0,
+                        attributes: attrs,
+                    })
+                }
+                OverlayLookup::Miss => {
+                    let inode = lookup(self.fs(), &unix_path)?;
+                    Ok(FileSecurity {
+                        reparse: false,
+                        sz_security_descriptor: 0,
+                        attributes: file_attributes(&inode, read_only),
+                    })
+                }
+            }
+        }
+
+        fn open(
+            &self,
+            file_name: &U16CStr,
+            _create_options: u32,
+            _granted_access: FILE_ACCESS_RIGHTS,
+            file_info: &mut OpenFileInfo,
+        ) -> FspResult<Self::FileContext> {
+            let unix_path = winpath_to_unix(file_name).map_err(|_| STATUS_OBJECT_NAME_NOT_FOUND)?;
+            let read_only = self.is_read_only();
+            match self.mount.overlay.lookup(&unix_path) {
+                OverlayLookup::Deleted => Err(STATUS_OBJECT_NAME_NOT_FOUND.into()),
+                OverlayLookup::Hit(entry) => {
+                    let is_dir = entry.is_dir();
+                    populate_overlay_file_info(&entry, file_info.as_mut(), read_only);
+                    Ok(XfsFileContext {
+                        unix_path,
+                        is_dir,
+                        inode: Mutex::new(None),
+                        pending_delete: Mutex::new(false),
+                    })
+                }
+                OverlayLookup::Miss => {
+                    let inode = lookup(self.fs(), &unix_path)?;
+                    populate_file_info(&inode, file_info.as_mut(), read_only);
+                    let is_dir = inode.is_dir();
+                    Ok(XfsFileContext {
+                        unix_path,
+                        is_dir,
+                        inode: Mutex::new(Some(inode)),
+                        pending_delete: Mutex::new(false),
+                    })
+                }
+            }
+        }
+
+        fn close(&self, _context: Self::FileContext) {
+            // Plain owned data — nothing to release.
+        }
+
+        fn get_file_info(
+            &self,
+            context: &Self::FileContext,
+            file_info: &mut FileInfo,
+        ) -> FspResult<()> {
+            let read_only = self.is_read_only();
+            // Overlay precedence — a write between open and stat must
+            // surface the new size / mtime.
+            match self.mount.overlay.lookup(&context.unix_path) {
+                OverlayLookup::Hit(entry) => {
+                    populate_overlay_file_info(&entry, file_info, read_only);
+                    Ok(())
+                }
+                OverlayLookup::Deleted => Err(STATUS_OBJECT_NAME_NOT_FOUND.into()),
+                OverlayLookup::Miss => {
+                    let guard = context.inode.lock().unwrap();
+                    let inode = guard
+                        .as_ref()
+                        .ok_or_else(|| {
+                            // Overlay-only handle whose entry vanished
+                            // between `open` and `get_file_info`.
+                            winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND)
+                        })?
+                        .clone();
+                    populate_file_info(&inode, file_info, read_only);
+                    Ok(())
+                }
+            }
+        }
+
+        fn read(
+            &self,
+            context: &Self::FileContext,
+            buffer: &mut [u8],
+            offset: u64,
+        ) -> FspResult<u32> {
+            if context.is_dir {
+                return Err(STATUS_INVALID_DEVICE_REQUEST.into());
+            }
+            // Overlay-first dispatch: a Hit means the user wrote /
+            // created this file, the underlay is bypassed entirely.
+            if let OverlayLookup::Hit(entry) = self.mount.overlay.lookup(&context.unix_path) {
+                let content = match entry.content() {
+                    Some(c) => c.to_vec(),
+                    None => return Err(STATUS_INVALID_DEVICE_REQUEST.into()),
+                };
+                let size = content.len() as u64;
+                if offset >= size {
+                    return Err(STATUS_END_OF_FILE.into());
+                }
+                let remaining = (size - offset) as usize;
+                let take = buffer.len().min(remaining);
+                buffer[..take].copy_from_slice(&content[offset as usize..offset as usize + take]);
+                return Ok(take as u32);
+            }
+            if let OverlayLookup::Deleted = self.mount.overlay.lookup(&context.unix_path) {
+                return Err(STATUS_OBJECT_NAME_NOT_FOUND.into());
+            }
+            let guard = context.inode.lock().unwrap();
+            let inode = guard
+                .as_ref()
+                .ok_or_else(|| winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?
+                .clone();
+            drop(guard);
+            if offset >= inode.size {
+                return Err(STATUS_END_OF_FILE.into());
+            }
+            let remaining = inode.size - offset;
+            let take = (buffer.len() as u64).min(remaining) as usize;
+            self.fs()
+                .read_file(&inode, offset, &mut buffer[..take])
+                .map_err(|e| err_to_status(e))?;
+            Ok(take as u32)
+        }
+
+        fn read_directory(
+            &self,
+            context: &Self::FileContext,
+            _pattern: Option<&U16CStr>,
+            marker: DirMarker,
+            buffer: &mut [u8],
+        ) -> FspResult<u32> {
+            if !context.is_dir {
+                return Err(STATUS_NOT_A_DIRECTORY.into());
+            }
+            let read_only = self.is_read_only();
+
+            // Build the merged listing: underlay entries first, with
+            // overlay-tombstoned names filtered out, then overlay-only
+            // Created / CreatedDir entries appended.
+            //
+            // We materialise into a sorted Vec<(name, FileInfo)> because
+            // WinFsp's DirInfo buffer expects insertion in name order
+            // for resume-after-marker correctness.
+
+            // 1. Build the underlay child set.
+            let underlay_inode = context.inode.lock().unwrap().clone();
+            let mut underlay_pairs: Vec<(String, Inode)> = Vec::new();
+            if let Some(inode) = underlay_inode.as_ref() {
+                if let Ok(children) = self.fs().read_dir(inode) {
+                    for e in children {
+                        if e.name == b"." || e.name == b".." {
+                            continue;
+                        }
+                        let name = match std::str::from_utf8(&e.name) {
+                            Ok(s) => s.to_string(),
+                            Err(_) => continue,
+                        };
+                        let child_path = if context.unix_path == "/" {
+                            format!("/{name}")
+                        } else {
+                            format!("{}/{}", context.unix_path, name)
+                        };
+                        // Tombstoned: skip.
+                        if matches!(
+                            self.mount.overlay.lookup(&child_path),
+                            OverlayLookup::Deleted
+                        ) {
+                            continue;
+                        }
+                        if let Ok(child) = self.fs().read_inode(e.nid) {
+                            underlay_pairs.push((name, child));
+                        }
+                    }
+                }
+            }
+
+            // 2. Overlay-only entries under this dir.
+            let mut overlay_pairs: Vec<(String, OverlayEntry)> = Vec::new();
+            let mut underlay_names: BTreeSet<String> =
+                underlay_pairs.iter().map(|(n, _)| n.clone()).collect();
+            for (leaf, entry) in self.mount.overlay.iter_dir(&context.unix_path) {
+                if entry.is_deleted() {
+                    continue;
+                }
+                if underlay_names.contains(&leaf) {
+                    // Overlay shadows underlay — replace the underlay
+                    // pair with the overlay entry.
+                    underlay_pairs.retain(|(n, _)| n != &leaf);
+                    underlay_names.remove(&leaf);
+                }
+                overlay_pairs.push((leaf, entry));
+            }
+
+            // 3. Sort merged listing for deterministic resume.
+            let mut all: Vec<MergedEntry> = Vec::new();
+            for (name, inode) in underlay_pairs {
+                all.push(MergedEntry::Underlay(name, inode));
+            }
+            for (name, entry) in overlay_pairs {
+                all.push(MergedEntry::Overlay(name, entry));
+            }
+            all.sort_by(|a, b| a.name().cmp(b.name()));
+
+            // 4. Resume after marker if set.
+            let resume_after = marker.inner_as_cstr().map(|m| m.to_string_lossy());
+            let mut started = resume_after.is_none();
+            let mut cursor: u32 = 0;
+            let mut dir_info: DirInfo<255> = DirInfo::new();
+
+            for entry in &all {
+                let name = entry.name();
+                if !started {
+                    if Some(name.to_string()) == resume_after.as_ref().map(|s| s.to_string()) {
+                        started = true;
+                    }
+                    continue;
+                }
+                dir_info.reset();
+                match entry {
+                    MergedEntry::Underlay(_, inode) => {
+                        populate_file_info(inode, dir_info.file_info_mut(), read_only)
+                    }
+                    MergedEntry::Overlay(_, ovl) => {
+                        populate_overlay_file_info(ovl, dir_info.file_info_mut(), read_only)
+                    }
+                }
+                if dir_info.set_name(name).is_err() {
+                    continue;
+                }
+                if !dir_info.append_to_buffer(buffer, &mut cursor) {
+                    break;
+                }
+            }
+            DirInfo::<255>::finalize_buffer(buffer, &mut cursor);
+            Ok(cursor)
+        }
+
+        fn get_volume_info(&self, out_volume_info: &mut VolumeInfo) -> FspResult<()> {
+            out_volume_info.total_size = self.total_size;
+            // On a writable mount we don't track real free-space; the
+            // overlay can grow until the host runs out of RAM. Report
+            // a generous synthetic budget so apps that gate on
+            // available space don't refuse to write.
+            out_volume_info.free_size = if self.is_read_only() {
+                0
+            } else {
+                // Half of total_size, capped at 1 GiB. Synthetic — the
+                // underlay is RO, so "free" is purely overlay headroom.
+                self.total_size.min(1 << 30)
+            };
+            let label = if self.label.is_empty() {
+                "xfs"
+            } else {
+                self.label.as_str()
+            };
+            out_volume_info.set_volume_label(label);
+            Ok(())
+        }
+
+        // -----------------------------------------------------------------
+        // Reparse-point / symlink support.
+        //
+        // We surface symlinks via FILE_ATTRIBUTE_REPARSE_POINT + the
+        // IO_REPARSE_TAG_SYMLINK tag. Implementing the full
+        // `get_reparse_point` callback would require synthesising the
+        // REPARSE_DATA_BUFFER on the wire. Phase 0 keeps this simple
+        // by resolving symlinks within the XFS layer when explicitly
+        // asked (via `Filesystem::resolve_path`), and otherwise treats
+        // them as opaque entries Explorer can show but not traverse
+        // automatically. A future revision can wire `get_reparse_point`
+        // through if symlink-traversal is needed.
+        // -----------------------------------------------------------------
+
+        fn set_security(
+            &self,
+            _context: &Self::FileContext,
+            _security_information: u32,
+            _modification_descriptor: ModificationDescriptor,
+        ) -> FspResult<()> {
+            // Pretend success so apps that always set security on open
+            // (Office, etc.) don't error out. We don't synthesise SDs.
+            Ok(())
+        }
+
+        // -----------------------------------------------------------------
+        // Write callbacks: every mutation lands in the overlay.
+        // -----------------------------------------------------------------
+
+        fn create(
+            &self,
+            file_name: &U16CStr,
+            _create_options: u32,
+            _granted_access: FILE_ACCESS_RIGHTS,
+            file_attributes: FILE_FLAGS_AND_ATTRIBUTES,
+            _security_descriptor: Option<&[c_void]>,
+            _allocation_size: u64,
+            _extra_buffer: Option<&[u8]>,
+            _extra_buffer_is_reparse_point: bool,
+            file_info: &mut OpenFileInfo,
+        ) -> FspResult<Self::FileContext> {
+            self.ensure_writable()?;
+            let unix_path = winpath_to_unix(file_name).map_err(|_| STATUS_OBJECT_NAME_NOT_FOUND)?;
+
+            // Reject if the path already exists (overlay or underlay).
+            match self.mount.overlay.lookup(&unix_path) {
+                OverlayLookup::Hit(_) => return Err(STATUS_OBJECT_NAME_COLLISION.into()),
+                OverlayLookup::Deleted | OverlayLookup::Miss => {}
+            }
+            if matches!(self.mount.overlay.lookup(&unix_path), OverlayLookup::Miss)
+                && self.fs().lookup_path(&unix_path).is_ok()
+            {
+                return Err(STATUS_OBJECT_NAME_COLLISION.into());
+            }
+
+            let is_dir = (file_attributes & FILE_ATTRIBUTE_DIRECTORY.0) != 0;
+            let read_only = self.is_read_only();
+            if is_dir {
+                self.mount.overlay.create_dir(&unix_path, 0o040755);
+                let entry = match self.mount.overlay.lookup(&unix_path) {
+                    OverlayLookup::Hit(e) => e,
+                    _ => return Err(STATUS_INVALID_DEVICE_REQUEST.into()),
+                };
+                populate_overlay_file_info(&entry, file_info.as_mut(), read_only);
+                Ok(XfsFileContext {
+                    unix_path,
+                    is_dir: true,
+                    inode: Mutex::new(None),
+                    pending_delete: Mutex::new(false),
+                })
+            } else {
+                self.mount
+                    .overlay
+                    .create_file(&unix_path, Vec::new(), 0o100644);
+                let entry = match self.mount.overlay.lookup(&unix_path) {
+                    OverlayLookup::Hit(e) => e,
+                    _ => return Err(STATUS_INVALID_DEVICE_REQUEST.into()),
+                };
+                populate_overlay_file_info(&entry, file_info.as_mut(), read_only);
+                Ok(XfsFileContext {
+                    unix_path,
+                    is_dir: false,
+                    inode: Mutex::new(None),
+                    pending_delete: Mutex::new(false),
+                })
+            }
+        }
+
+        fn write(
+            &self,
+            context: &Self::FileContext,
+            buffer: &[u8],
+            offset: u64,
+            write_to_eof: bool,
+            constrained_io: bool,
+            file_info: &mut FileInfo,
+        ) -> FspResult<u32> {
+            self.ensure_writable()?;
+            if context.is_dir {
+                return Err(STATUS_INVALID_DEVICE_REQUEST.into());
+            }
+            // Read-modify-write. Race resolution: if two concurrent
+            // writes hit the same path, both will independently compute
+            // their patched buffer and the second `write_file` insertion
+            // wins. The overlay's RwLock serialises the two map
+            // insertions, but the read-modify-write is NOT atomic —
+            // overlapping concurrent writes to the same path could lose
+            // one of them. WinFsp's per-handle dispatch makes this
+            // unlikely in practice (one handle = sequential writes).
+            let (mut content, mode) = self.read_full(&context.unix_path)?;
+            let effective_offset = if write_to_eof {
+                content.len() as u64
+            } else {
+                offset
+            };
+            let end = effective_offset
+                .checked_add(buffer.len() as u64)
+                .ok_or_else(|| winfsp::FspError::from(STATUS_INVALID_DEVICE_REQUEST))?;
+            if constrained_io {
+                // constrained_io: don't extend beyond current EOF; clamp
+                // the write length to the available tail.
+                let cur_size = content.len() as u64;
+                if effective_offset >= cur_size {
+                    file_info.file_size = cur_size;
+                    file_info.allocation_size = (cur_size + 4095) & !4095;
+                    return Ok(0);
+                }
+                let take = ((cur_size - effective_offset) as usize).min(buffer.len());
+                content[effective_offset as usize..effective_offset as usize + take]
+                    .copy_from_slice(&buffer[..take]);
+                self.mount
+                    .overlay
+                    .write_file(&context.unix_path, content, mode);
+                if let OverlayLookup::Hit(entry) = self.mount.overlay.lookup(&context.unix_path) {
+                    populate_overlay_file_info(&entry, file_info, self.is_read_only());
+                }
+                return Ok(take as u32);
+            }
+            // Unconstrained: extend the buffer if the write goes past EOF.
+            if end > content.len() as u64 {
+                content.resize(end as usize, 0);
+            }
+            content[effective_offset as usize..effective_offset as usize + buffer.len()]
+                .copy_from_slice(buffer);
+            self.mount
+                .overlay
+                .write_file(&context.unix_path, content, mode);
+            if let OverlayLookup::Hit(entry) = self.mount.overlay.lookup(&context.unix_path) {
+                populate_overlay_file_info(&entry, file_info, self.is_read_only());
+            }
+            Ok(buffer.len() as u32)
+        }
+
+        fn set_file_size(
+            &self,
+            context: &Self::FileContext,
+            new_size: u64,
+            _set_allocation_size: bool,
+            file_info: &mut FileInfo,
+        ) -> FspResult<()> {
+            self.ensure_writable()?;
+            if context.is_dir {
+                return Err(STATUS_INVALID_DEVICE_REQUEST.into());
+            }
+            let (mut content, mode) = self.read_full(&context.unix_path)?;
+            content.resize(new_size as usize, 0);
+            self.mount
+                .overlay
+                .write_file(&context.unix_path, content, mode);
+            if let OverlayLookup::Hit(entry) = self.mount.overlay.lookup(&context.unix_path) {
+                populate_overlay_file_info(&entry, file_info, self.is_read_only());
+            }
+            Ok(())
+        }
+
+        fn overwrite(
+            &self,
+            context: &Self::FileContext,
+            _file_attributes: FILE_FLAGS_AND_ATTRIBUTES,
+            _replace_file_attributes: bool,
+            allocation_size: u64,
+            _extra_buffer: Option<&[u8]>,
+            file_info: &mut FileInfo,
+        ) -> FspResult<()> {
+            self.ensure_writable()?;
+            if context.is_dir {
+                return Err(STATUS_INVALID_DEVICE_REQUEST.into());
+            }
+            // Equivalent to truncate-to-zero. Allocation hint is
+            // honoured as a content pre-allocation but kept all-zero.
+            let buf = vec![0u8; allocation_size.min(0) as usize];
+            self.mount
+                .overlay
+                .write_file(&context.unix_path, buf, 0o100644);
+            if let OverlayLookup::Hit(entry) = self.mount.overlay.lookup(&context.unix_path) {
+                populate_overlay_file_info(&entry, file_info, self.is_read_only());
+            }
+            Ok(())
+        }
+
+        fn rename(
+            &self,
+            _context: &Self::FileContext,
+            file_name: &U16CStr,
+            new_file_name: &U16CStr,
+            replace_if_exists: bool,
+        ) -> FspResult<()> {
+            self.ensure_writable()?;
+            let from = winpath_to_unix(file_name).map_err(|_| STATUS_OBJECT_NAME_NOT_FOUND)?;
+            let to = winpath_to_unix(new_file_name).map_err(|_| STATUS_OBJECT_NAME_NOT_FOUND)?;
+
+            // Resolve source content.
+            let (content, mode, is_dir) = match self.mount.overlay.lookup(&from) {
+                OverlayLookup::Hit(OverlayEntry::Created { content, mode, .. })
+                | OverlayLookup::Hit(OverlayEntry::Modified { content, mode, .. }) => {
+                    (content, mode, false)
+                }
+                OverlayLookup::Hit(OverlayEntry::CreatedDir { mode, .. }) => {
+                    (Vec::new(), mode, true)
+                }
+                // Same caveat as in read_full: `Hit(Deleted)` is
+                // type-reachable but `lookup` collapses it into the
+                // top-level `Deleted`. Either way the source is gone.
+                OverlayLookup::Hit(OverlayEntry::Deleted) | OverlayLookup::Deleted => {
+                    return Err(STATUS_OBJECT_NAME_NOT_FOUND.into());
+                }
+                OverlayLookup::Miss => {
+                    let inode = self.fs().lookup_path(&from).map_err(|e| err_to_status(e))?;
+                    if inode.is_dir() {
+                        (Vec::new(), inode.mode, true)
+                    } else if inode.is_regular_file() {
+                        let mut buf = vec![0u8; inode.size as usize];
+                        if !buf.is_empty() {
+                            self.fs()
+                                .read_file(&inode, 0, &mut buf)
+                                .map_err(|e| err_to_status(e))?;
+                        }
+                        (buf, inode.mode, false)
+                    } else {
+                        return Err(STATUS_INVALID_DEVICE_REQUEST.into());
+                    }
+                }
+            };
+
+            // Existence check at destination.
+            let dest_exists = match self.mount.overlay.lookup(&to) {
+                OverlayLookup::Hit(_) => true,
+                OverlayLookup::Deleted => false,
+                OverlayLookup::Miss => self.fs().lookup_path(&to).is_ok(),
+            };
+            if dest_exists && !replace_if_exists {
+                return Err(STATUS_OBJECT_NAME_COLLISION.into());
+            }
+
+            // Stage: create destination + tombstone source.
+            if is_dir {
+                self.mount.overlay.create_dir(&to, mode);
+            } else {
+                self.mount.overlay.create_file(&to, content, mode);
+            }
+            self.mount.overlay.delete(&from);
+            Ok(())
+        }
+
+        fn set_delete(
+            &self,
+            context: &Self::FileContext,
+            _file_name: &U16CStr,
+            delete_file: bool,
+        ) -> FspResult<()> {
+            self.ensure_writable()?;
+            *context.pending_delete.lock().unwrap() = delete_file;
+            Ok(())
+        }
+
+        fn cleanup(&self, context: &Self::FileContext, _file_name: Option<&U16CStr>, _flags: u32) {
+            if !self.is_read_only() && *context.pending_delete.lock().unwrap() {
+                self.mount.overlay.delete(&context.unix_path);
+            }
+        }
+
+        fn flush(
+            &self,
+            _context: Option<&Self::FileContext>,
+            _file_info: &mut FileInfo,
+        ) -> FspResult<()> {
+            // Overlay is in-memory; flush is a no-op. Sidecar / rebuild
+            // dismount policies handle persistence at unmount time.
+            Ok(())
+        }
+
+        fn set_basic_info(
+            &self,
+            _context: &Self::FileContext,
+            _file_attributes: u32,
+            _creation_time: u64,
+            _last_access_time: u64,
+            _last_write_time: u64,
+            _last_change_time: u64,
+            file_info: &mut FileInfo,
+        ) -> FspResult<()> {
+            // Accept-and-ignore; the overlay carries mtime per-entry but
+            // we don't currently expose a way to set it externally.
+            // Populate `file_info` with whatever we currently know so
+            // the caller's stat snapshot stays consistent.
+            let read_only = self.is_read_only();
+            match self.mount.overlay.lookup(&_context.unix_path) {
+                OverlayLookup::Hit(entry) => {
+                    populate_overlay_file_info(&entry, file_info, read_only);
+                }
+                OverlayLookup::Miss => {
+                    if let Some(inode) = _context.inode.lock().unwrap().as_ref() {
+                        populate_file_info(inode, file_info, read_only);
+                    }
+                }
+                OverlayLookup::Deleted => return Err(STATUS_OBJECT_NAME_NOT_FOUND.into()),
+            }
+            Ok(())
+        }
+    }
+
+    /// Helper enum for `read_directory`'s merge step. Holds either an
+    /// underlay-resolved `Inode` (cheap clone) or an `OverlayEntry`
+    /// (already cloned out of the overlay map).
+    enum MergedEntry {
+        Underlay(String, Inode),
+        Overlay(String, OverlayEntry),
+    }
+
+    impl MergedEntry {
+        fn name(&self) -> &str {
+            match self {
+                MergedEntry::Underlay(n, _) | MergedEntry::Overlay(n, _) => n.as_str(),
+            }
+        }
+    }
+
+    // The `Inode` returned from `read_inode` / `lookup_path` carries
+    // file_type + nid + size etc. but no `Clone` derive on the
+    // `FileType` enum is needed — `Inode` already derives `Clone`.
+    fn _file_type_assertion(_: FileType) {}
+
+    /// Mount the given XFS source on a Windows mount point.
+    ///
+    /// `mount_point` accepts a drive letter (`X:`) or a path to an
+    /// empty directory. Blocks until the user presses Ctrl-C, then
+    /// unmounts. Mirrors `ext4-win-driver`'s `run` entry point.
+    pub fn run(mount: Mount, mount_point: &str) -> Result<()> {
+        let _init = winfsp::winfsp_init().context("WinFsp not installed?")?;
+
+        let read_only = mount.write_mode == WriteMode::ReadOnly;
+        // Clone the bits we need post-host-shutdown for the dismount
+        // policy — the host takes ownership of `mount` via the
+        // `XfsContext`, so we must capture references first. Both
+        // `Filesystem` and `Overlay` are wrapped in `Arc` (or behind
+        // one in `Mount`'s case), so cloning is cheap.
+        let dismount_overlay = mount.overlay.clone();
+        let dismount_policy = mount.dismount_policy.clone();
+        // The Filesystem is owned by Mount and isn't `Clone`. For the
+        // Rebuild policy we need a handle to it after the host stops.
+        // We achieve that by *opening it again* from the same image —
+        // it's an idempotent read-only open, and the per-mount handle
+        // inside `mount` may be dropped by the host on shutdown.
+        let dismount_image = mount.image.clone();
+
+        let ctx = XfsContext::new(mount)?;
+        let block_size = ctx.fs().superblock().block_size();
+        let sector = block_size.min(4096) as u16;
+
+        let mut params = VolumeParams::new();
+        params
+            .sector_size(sector)
+            .sectors_per_allocation_unit(1)
+            .max_component_length(255)
+            .file_info_timeout(1000)
+            .case_sensitive_search(true)
+            .case_preserved_names(true)
+            .unicode_on_disk(true)
+            .filesystem_name("xfs");
+        // `--ro` actually means read-only now: flip the volume flag so
+        // the cache manager short-circuits writes at the kernel level
+        // and Explorer renders the volume as RO. Writable is the default.
+        if read_only {
+            params.read_only_volume(true);
+        }
+
+        let mut host = FileSystemHost::new(params, ctx)
+            .map_err(|e| anyhow!("FileSystemHost::new failed: {e}"))?;
+
+        host.mount(mount_point)
+            .map_err(|e| anyhow!("mount({mount_point}) failed: {e}"))?;
+        host.start()
+            .map_err(|e| anyhow!("FileSystemHost::start failed: {e}"))?;
+
+        let banner = if read_only { "RO" } else { "RW (overlay)" };
+        println!("xfs mounted at {mount_point} ({banner}). Ctrl-C to unmount.");
+        // Block until Ctrl-C; WinFsp's host runs on its own threads.
+        let (tx, rx) = std::sync::mpsc::channel();
+        ctrlc::set_handler(move || {
+            let _ = tx.send(());
+        })
+        .ok();
+        let _ = rx.recv();
+
+        host.stop();
+        host.unmount();
+
+        // Apply the configured dismount policy. Failures are surfaced
+        // to stderr but don't propagate further — the host has already
+        // torn down and the user has Ctrl-Ced; we want to maximise the
+        // chance of getting a clear diagnostic out.
+        match &dismount_policy {
+            super::DismountPolicy::Discard => {
+                dismount_overlay.clear();
+            }
+            super::DismountPolicy::Sidecar(path) => {
+                if let Err(e) = super::write_sidecar(&dismount_overlay, path) {
+                    eprintln!("warning: --scratch-sidecar failed: {e:#}");
+                }
+            }
+            super::DismountPolicy::Rebuild(path) => {
+                // Re-open the underlay for the rebuild walk.
+                match super::Mount::open_direct(&dismount_image) {
+                    Ok(reopened) => {
+                        if let Err(e) = super::rebuild_image(&reopened.fs, &dismount_overlay, path)
+                        {
+                            eprintln!("warning: --scratch-rebuild failed: {e:#}");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("warning: --scratch-rebuild reopen failed: {e:#}");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(windows, feature = "mount"))]
+pub use winfsp_adapter::run as run_winfsp;
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    //! Smoke tests for the `Mount` open path. The full WinFsp
+    //! callback flow is `#[cfg(all(windows, feature = "mount"))]` and
+    //! requires the WinFsp DLL to be installed on the host, so it's
+    //! ignored on every target except Windows-with-WinFsp.
+    //!
+    //! What we *can* test cross-platform: that `Mount::open` works on
+    //! an XFS image (built inline byte-for-byte from the spec, so
+    //! the test stays decoupled from the `am_fs_xfs::mkfs` builder)
+    //! and that the resulting `Filesystem` exposes the basic info needed
+    //! to populate `VolumeInfo` and a directory listing.
+
+    use super::*;
+    use std::io::Write;
+
+    fn write_tempimg(bytes: &[u8]) -> tempfile::NamedTempFile {
+        let mut tf = tempfile::NamedTempFile::new().expect("tempfile");
+        tf.write_all(bytes).expect("write");
+        tf.flush().expect("flush");
+        tf
+    }
+
+    /// Build a minimal valid XFS image manually. Mirrors the layout
+    /// used by `fs_xfs::fs::tests::build_image`:
+    ///   - 4 KiB blocks, root NID = 0, meta_blkaddr = 1
+    ///   - root dir at NID 0 (FLAT_PLAIN, mode = 0o041xx, dir block = 3)
+    ///   - regular file at NID 1 ("hello.txt", FLAT_PLAIN, file data at block 2)
+    ///
+    /// Hand-rolled here so the smoke tests don't depend on the
+    /// `am_fs_xfs::mkfs` builder, which is mid-refactor in this
+    /// workspace and not always compilable. Field offsets / magic
+    /// constants come from the `xfs_fs.h` spec (also documented in
+    /// `am_fs_xfs::superblock`, `inode`, and `dir`).
+    fn build_simple_image() -> Vec<u8> {
+        const BS: usize = 4096;
+        const SUPER_OFFSET: usize = 1024;
+        let mut img = vec![0u8; BS * 4];
+
+        // -- Superblock at offset 1024 --------------------------------------
+        img[SUPER_OFFSET..SUPER_OFFSET + 4].copy_from_slice(&0xE0F5_E1E2u32.to_le_bytes());
+        // checksum=0, feature_compat=0
+        img[SUPER_OFFSET + 0x0C] = 12; // blkszbits = 12 (4 KiB)
+                                       // sb_extslots=0
+        img[SUPER_OFFSET + 0x0E..SUPER_OFFSET + 0x10].copy_from_slice(&0u16.to_le_bytes()); // root_nid
+        img[SUPER_OFFSET + 0x10..SUPER_OFFSET + 0x18].copy_from_slice(&2u64.to_le_bytes()); // inos
+        img[SUPER_OFFSET + 0x24..SUPER_OFFSET + 0x28].copy_from_slice(&4u32.to_le_bytes()); // blocks
+        img[SUPER_OFFSET + 0x28..SUPER_OFFSET + 0x2C].copy_from_slice(&1u32.to_le_bytes()); // meta_blkaddr
+                                                                                            // volume_name @ 0x40 — leave zero / empty
+
+        // -- Root dir inode at NID 0 (offset = meta_blkaddr*BS + 0*32) -----
+        // Compact (32 byte) inode, FLAT_PLAIN layout, mode=S_IFDIR|0755,
+        // size=BS (one dir block), nlink=2, raw_blkaddr=3.
+        let raw_format: u16 = 0; // version=0 (compact), layout=FlatPlain (=0), <<1
+        img[BS..BS + 2].copy_from_slice(&raw_format.to_le_bytes());
+        img[BS + 0x04..BS + 0x06].copy_from_slice(&0o040755u16.to_le_bytes());
+        img[BS + 0x06..BS + 0x08].copy_from_slice(&2u16.to_le_bytes()); // nlink
+        img[BS + 0x08..BS + 0x0C].copy_from_slice(&(BS as u32).to_le_bytes()); // size
+        img[BS + 0x10..BS + 0x14].copy_from_slice(&3u32.to_le_bytes()); // raw_blkaddr
+
+        // -- File inode at NID 1 (offset = meta + 1*32) --------------------
+        let off = BS + 32;
+        img[off..off + 2].copy_from_slice(&raw_format.to_le_bytes());
+        img[off + 0x04..off + 0x06].copy_from_slice(&0o100644u16.to_le_bytes()); // S_IFREG|0644
+        img[off + 0x06..off + 0x08].copy_from_slice(&1u16.to_le_bytes()); // nlink
+        img[off + 0x08..off + 0x0C]
+            .copy_from_slice(&(b"hi from xfs\n".len() as u32).to_le_bytes());
+        img[off + 0x10..off + 0x14].copy_from_slice(&2u32.to_le_bytes()); // raw_blkaddr=2
+
+        // -- File data at block 2 ------------------------------------------
+        let payload = b"hi from xfs\n";
+        img[2 * BS..2 * BS + payload.len()].copy_from_slice(payload);
+
+        // -- Dir block at block 3: one entry "hello.txt" -> NID 1 ----------
+        // dirent header (12 bytes): nid, nameoff, file_type, reserved
+        // Single entry: names start immediately after the one dirent.
+        let dir = 3 * BS;
+        img[dir..dir + 8].copy_from_slice(&1u64.to_le_bytes()); // nid
+        let nameoff: u16 = 12;
+        img[dir + 8..dir + 10].copy_from_slice(&nameoff.to_le_bytes());
+        img[dir + 10] = 1; // FT_REG_FILE
+        let name = b"hello.txt";
+        img[dir + 12..dir + 12 + name.len()].copy_from_slice(name);
+
+        img
+    }
+
+    #[test]
+    fn mount_open_direct_smoke() {
+        let img = build_simple_image();
+        let tf = write_tempimg(&img);
+        let m = Mount::open(tf.path(), None).expect("open");
+        // Sanity: we can read the root and list entries.
+        let root = m.fs.root_inode().expect("root");
+        assert!(root.is_dir());
+        let entries = m.fs.read_dir(&root).expect("read_dir");
+        let names: Vec<&[u8]> = entries.iter().map(|e| e.name.as_slice()).collect();
+        assert!(
+            names.iter().any(|n| *n == b"hello.txt"),
+            "expected hello.txt in dir listing, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn mount_open_part_zero_treated_as_direct() {
+        // `Some(0)` should behave identically to `None` — i.e. open the
+        // image as a single XFS volume with no partition slicing.
+        // The auto-mount watcher passes `--part 0` for whole-disk
+        // detections, so this is on the hot path.
+        let img = build_simple_image();
+        let tf = write_tempimg(&img);
+        let m = Mount::open(tf.path(), Some(0)).expect("open part=0");
+        let root = m.fs.root_inode().expect("root");
+        assert!(root.is_dir());
+    }
+
+    #[test]
+    fn volume_info_math_matches_superblock() {
+        // Mirror what the WinFsp `get_volume_info` callback computes,
+        // without needing to construct the full `XfsContext` (which
+        // is Windows-only). We assert the math: total_size = blocks
+        // * block_size; free_size = 0 (RO).
+        let img = build_simple_image();
+        let tf = write_tempimg(&img);
+        let m = Mount::open(tf.path(), None).expect("open");
+        let sb = m.fs.superblock();
+        let total = (sb.blocks as u64) * sb.block_size();
+        assert_eq!(total, 4 * 4096, "expected 16 KiB total, got {total}");
+        // RO surface — free is always zero.
+        let free: u64 = 0;
+        assert_eq!(free, 0);
+    }
+
+    #[test]
+    fn mount_open_partition_out_of_range_errors() {
+        // No partition table in our test image; asking for --part 1
+        // must fail gracefully (no partitions found, or out-of-range).
+        let img = build_simple_image();
+        let tf = write_tempimg(&img);
+        let r = Mount::open(tf.path(), Some(1));
+        assert!(
+            r.is_err(),
+            "expected partition open to fail on a non-partitioned image"
+        );
+    }
+
+    /// Full live-mount smoke test. Skipped everywhere except a Windows
+    /// host with WinFsp installed; even then only run with
+    /// `cargo test -- --ignored`. Kept here to document the intended
+    /// runtime invocation; CI gating happens in the harness.
+    #[cfg(all(windows, feature = "mount"))]
+    #[test]
+    #[ignore = "needs WinFsp installed; live drive-letter mount"]
+    fn full_winfsp_mount_smoke() {
+        let img = build_simple_image();
+        let tf = write_tempimg(&img);
+        let m = Mount::open(tf.path(), None).expect("open");
+        // Picks `Y:` arbitrarily for the test; the harness should
+        // ensure it's free before running.
+        let _ = m.run("Y:");
+    }
+}

@@ -1,0 +1,128 @@
+{
+  "_format": "v2",
+  "_doc": "xfs-win-driver matrix. XFS is read-only natively, so coverage focuses on host-side info/ls/cat probes plus vm-side mount + readback. RW (overlay-sidecar) scenarios are deferred — they need a sidecar emit + replay op shape not present in the shared scripts/win/. Test images are built by fixtures/build-test-disks.sh into ../rust-fs-xfs/test-disks/. Hashes captured against the canonical xfs-basic.img produced by mkfs_xfs over a synthesised source tree.",
+  "scenarios": {
+    "basic-info-volume": {
+      "status": "pending",
+      "image": "xfs-basic.img",
+      "_attempts": [],
+      "_notes": "Volume-level smoke. Asserts block_size + volume_name substrings so superblock decoding regressions trip a verdict. Capture: ./target/release/xfs info ../rust-fs-xfs/test-disks/xfs-basic.img",
+      "recipe": [
+        {
+          "op": "verify-info",
+          "expect_args": "'--expect-stdout-contains' 'block size       4096'"
+        },
+        {
+          "op": "verify-info",
+          "expect_args": "'--expect-stdout-contains' 'volume name      \"rsmkfs\"'"
+        }
+      ]
+    },
+    "basic-ro-list-root": {
+      "status": "pending",
+      "image": "xfs-basic.img",
+      "_attempts": [],
+      "_notes": "Root-dir listing. Validates dirent decoding + name-set against the canonical xfs-basic.img source tree (test.txt, subdir/).",
+      "recipe": [
+        {
+          "op": "verify-ls",
+          "path": "/",
+          "expect_args": "'--expect-name' '.' '--expect-name' '..' '--expect-name' 'subdir' '--expect-name' 'test.txt'"
+        },
+        {
+          "op": "verify-ls",
+          "path": "/",
+          "expect_args": "'--expect-count' '4'"
+        }
+      ]
+    },
+    "basic-ro-list-subdir": {
+      "status": "pending",
+      "image": "xfs-basic.img",
+      "_attempts": [],
+      "_notes": "Subdirectory listing. Validates non-root dirent traversal.",
+      "recipe": [
+        {
+          "op": "verify-ls",
+          "path": "/subdir",
+          "expect_args": "'--expect-name' '.' '--expect-name' '..' '--expect-name' 'nested.txt'"
+        }
+      ]
+    },
+    "basic-ro-cat-test-txt": {
+      "status": "pending",
+      "image": "xfs-basic.img",
+      "_attempts": [],
+      "_notes": "Read content matches sha256 on /test.txt. Capture: printf 'hello from xfs\\n' | shasum -a 256 -> 68f426e9...",
+      "recipe": [
+        {
+          "op": "verify-cat",
+          "path": "/test.txt",
+          "expect_args": "'--expect-size' '17' '--expect-sha256' '68f426e9fbc8c7bb8ccb49037bc2aab582009cf499a57bffdf7b4971d9eef196'"
+        }
+      ]
+    },
+    "basic-ro-cat-nested": {
+      "status": "pending",
+      "image": "xfs-basic.img",
+      "_attempts": [],
+      "_notes": "Read content matches sha256 on /subdir/nested.txt. Catches subdir-file extent decoding.",
+      "recipe": [
+        {
+          "op": "verify-cat",
+          "path": "/subdir/nested.txt",
+          "expect_args": "'--expect-size' '7' '--expect-sha256' '370a8c04b8a65bb4494275eec227f1b694db04c76da6b0b8ae88ed1ab19790a3'"
+        }
+      ]
+    },
+    "win-mount-ls-root": {
+      "status": "pending",
+      "image": "xfs-basic.img",
+      "_attempts": [],
+      "_notes": "End-to-end vm-side mount + listing via WinFsp drive letter. Self-contained mount-do-unmount per win-ls-via-mount step (cross-step persistent mounts don't survive single-SSH-per-step dispatch).",
+      "recipe": [
+        {
+          "op": "ship-to-vm",
+          "src": "{image_dir}/xfs-basic.img",
+          "dest": "{vm.workdir}/xfs-basic.img"
+        },
+        {
+          "op": "win-ls-via-mount",
+          "path": "/",
+          "expect_names_csv": ".,..,subdir,test.txt",
+          "drive": "Z",
+          "expect_count": "__none__",
+          "extra": "__none__"
+        }
+      ]
+    },
+    "win-mount-cat-test-txt": {
+      "status": "pending",
+      "image": "xfs-basic.img",
+      "_attempts": [],
+      "_notes": "End-to-end vm-side mount + read of /test.txt via WinFsp drive letter. Validates the full WinFsp -> rust-fs-xfs read path on Windows.",
+      "recipe": [
+        {
+          "op": "ship-to-vm",
+          "src": "{image_dir}/xfs-basic.img",
+          "dest": "{vm.workdir}/xfs-basic.img"
+        },
+        {
+          "op": "win-cat-via-mount",
+          "path": "/test.txt",
+          "expect_size": "17",
+          "expect_sha256": "68f426e9fbc8c7bb8ccb49037bc2aab582009cf499a57bffdf7b4971d9eef196",
+          "drive": "Z",
+          "expect_content": "__none__",
+          "extra": "__none__"
+        }
+      ]
+    },
+    "overlay-sidecar-marker": {
+      "status": "blocked-needs-sidecar-op-shape",
+      "image": "xfs-basic.img",
+      "_attempts": [],
+      "_notes": "Placeholder for overlay-sidecar (--scratch-sidecar) coverage. The driver's RW path is in-memory overlay only; on dismount with --scratch-sidecar=PATH it serialises overlay state to JSON. The shared scripts/win/ ops don't have a sidecar emit + replay op shape, and per inst 2's review that shape is consumer-specific (not upstream-worthy). Unblock requires writing xfs-specific powershell op-defs in this repo's scripts/win/xfs-sidecar-*.ps1 plus matching [ops.xfs-sidecar-*] entries in harness.toml. Defer until the user signals interest in RW coverage."
+    }
+  }
+}
