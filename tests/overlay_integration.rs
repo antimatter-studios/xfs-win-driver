@@ -1,311 +1,216 @@
-//! Overlay integration tests.
+//! The writable overlay, over a real XFS underlay.
 //!
-//! GATED OFF UNTIL `am-fs-xfs` CAN FORMAT. Every fixture in this file is
-//! built with `fs_xfs::mkfs::build_image`, and that module does not
-//! exist: creating an XFS filesystem from nothing is unfinished work in
-//! the reader — the superblock writer landed, the allocation group
-//! headers, btrees, root inode and log have not.
+//! XFS is mounted read-only here and every write is staged in memory, so
+//! these check the thing that actually matters about the overlay: that a
+//! staged change is visible to subsequent reads **and that the image on
+//! disk is untouched**. The second half is the safety property — a
+//! driver that quietly wrote through would pass the first half alone.
 //!
-//! Kept rather than deleted, because the tests themselves are sound and
-//! the only thing missing is a way to produce an image to run them
-//! against. When `mkfs.xfs` exists, delete the `cfg` below and they
-//! should build unchanged — the feature it names is deliberately one
-//! that no `Cargo.toml` defines, so the file compiles to nothing today
-//! and cannot be enabled by accident.
-#![cfg(feature = "xfs-mkfs-fixtures")]
+//! REWRITTEN 2026-09-04. The previous version built its underlay with
+//! `fs_xfs::mkfs::build_image`, a module that does not exist — creating
+//! an XFS filesystem from nothing is unfinished work in the reader — and
+//! the whole file was gated off behind a feature nothing enabled. It
+//! came from `erofs-win-driver`, where that module does exist.
+//!
+//! Two tests are gone rather than rewritten: `dismount_rebuild_*`
+//! exercised `DismountPolicy::Rebuild`, which serialises the overlay
+//! into a fresh image through the reader's `mkfs`. That policy is
+//! removed from this driver for the same reason, so there is nothing
+//! left for them to test. They come back with `mkfs.xfs`.
 
-use std::collections::BTreeMap;
-use std::io::Write;
+mod common;
 
-use fs_xfs::mkfs::{build_image, Node, NodeMeta, DEFAULT_DIR_MODE, DEFAULT_FILE_MODE};
-use fs_xfs::Filesystem;
-
+use common::{fixture_or_skip, has_our_content, mount};
 use xfs_win_driver::mount::{DismountPolicy, Mount};
 
-/// Build a small XFS image with:
-/// - `/hello.txt` → "hi from underlay\n"
-/// - `/dir/inner.txt` → "inner\n"
-///
-/// Returns the raw bytes ready to be written to a tempfile.
-fn build_underlay_image() -> Vec<u8> {
-    let mut root_entries: BTreeMap<String, Node> = BTreeMap::new();
-    root_entries.insert(
-        "hello.txt".into(),
-        Node::File {
-            mode: DEFAULT_FILE_MODE,
-            data: b"hi from underlay\n".to_vec(),
-            meta: NodeMeta::default(),
-            xattrs: Vec::new(),
-        },
-    );
-    let mut dir_entries: BTreeMap<String, Node> = BTreeMap::new();
-    dir_entries.insert(
-        "inner.txt".into(),
-        Node::File {
-            mode: DEFAULT_FILE_MODE,
-            data: b"inner\n".to_vec(),
-            meta: NodeMeta::default(),
-            xattrs: Vec::new(),
-        },
-    );
-    root_entries.insert(
-        "dir".into(),
-        Node::Dir {
-            mode: DEFAULT_DIR_MODE,
-            entries: dir_entries,
-            meta: NodeMeta::default(),
-            xattrs: Vec::new(),
-        },
-    );
-    build_image(
-        Node::Dir {
-            mode: DEFAULT_DIR_MODE,
-            entries: root_entries,
-            meta: NodeMeta::default(),
-            xattrs: Vec::new(),
-        },
-        12,
-    )
-    .expect("build_image")
-}
+/// A path the fixture is known to contain, with its bytes. Tests that
+/// need specific content use this; tests that only need "some file"
+/// find one by walking.
+const KNOWN_FILE: &str = "/small.txt";
+const KNOWN_BYTES: &[u8] = b"hello xfs";
 
-fn write_tempimg(bytes: &[u8]) -> tempfile::NamedTempFile {
-    let mut tf = tempfile::NamedTempFile::new().expect("tempfile");
-    tf.write_all(bytes).expect("write");
-    tf.flush().expect("flush");
-    tf
+/// Open the fixture as a mount, skipping with a reason when there is no
+/// image or when it lacks the content the script writes.
+fn open_fixture() -> Option<(Mount, std::path::PathBuf)> {
+    let img = fixture_or_skip()?;
+    let fs = mount(&img);
+    if !has_our_content(&fs) {
+        eprintln!("SKIPPED: fixture lacks the deliberate content; run scripts/build-fixtures.sh");
+        return None;
+    }
+    let m = Mount::open_direct(&img).expect("open the fixture");
+    Some((m, img))
 }
 
 #[test]
-fn read_existing_underlay_file_returns_underlay_content() {
-    let img = build_underlay_image();
-    let tf = write_tempimg(&img);
-    let m = Mount::open_direct(tf.path()).expect("open");
-    let content = m.read_path("/hello.txt").expect("read /hello.txt");
-    assert_eq!(content, b"hi from underlay\n".to_vec());
+fn an_unmodified_file_reads_from_the_underlay() {
+    let Some((m, _)) = open_fixture() else { return };
+    assert_eq!(
+        m.read_path(KNOWN_FILE).expect("read"),
+        KNOWN_BYTES,
+        "with nothing staged, a read must come straight from the image"
+    );
+}
+
+/// The central property: a staged write is visible through the mount,
+/// and the image on disk still holds the original bytes.
+#[test]
+fn a_staged_write_is_visible_but_the_image_is_untouched() {
+    let Some((m, img)) = open_fixture() else {
+        return;
+    };
+
+    // Mirrors the WinFsp sequence: truncate, then write.
+    m.set_size_path(KNOWN_FILE, 0).expect("truncate");
+    m.write_path(KNOWN_FILE, 0, b"OVERWRITTEN").expect("write");
+    assert_eq!(
+        m.read_path(KNOWN_FILE).expect("read back"),
+        b"OVERWRITTEN",
+        "the staged bytes should be what a subsequent read sees"
+    );
+
+    // Re-open the image independently. This is the assertion that makes
+    // the overlay worth having: if the driver wrote through, the file on
+    // disk would have changed.
+    let untouched = mount(&img);
+    let on_disk = untouched
+        .open(KNOWN_FILE)
+        .expect("the file is still there")
+        .read_all()
+        .expect("read it from disk");
+    assert_eq!(
+        on_disk, KNOWN_BYTES,
+        "the underlay image was modified — the overlay is supposed to be in memory only"
+    );
 }
 
 #[test]
-fn write_to_existing_file_overrides_underlay_for_subsequent_reads() {
-    let img = build_underlay_image();
-    let tf = write_tempimg(&img);
-    let m = Mount::open_direct(tf.path()).expect("open");
-
-    // Mirror the WinFsp create-truncating-write sequence: shrink to
-    // zero first, then write the new bytes. The native `write`
-    // callback patches in place; truncation comes through
-    // `set_file_size` (or the create-replacing flag).
-    m.set_size_path("/hello.txt", 0).expect("truncate");
-    m.write_path("/hello.txt", 0, b"OVERWRITTEN\n")
-        .expect("write");
-    let content = m.read_path("/hello.txt").expect("read after write");
-    assert_eq!(content, b"OVERWRITTEN\n".to_vec());
-
-    // Re-open the underlay independently — its bytes must be unchanged.
-    let dev = fs_core::FileDevice::open(tf.path()).expect("reopen device");
-    use std::sync::Arc;
-    let dev: Arc<dyn fs_core::BlockRead> = Arc::new(dev);
-    let underlay = Filesystem::open(dev).expect("reopen underlay");
-    let inode = underlay.lookup_path("/hello.txt").expect("underlay lookup");
-    let mut buf = vec![0u8; inode.size as usize];
-    underlay
-        .read_file(&inode, 0, &mut buf)
-        .expect("underlay read");
-    assert_eq!(buf, b"hi from underlay\n".to_vec());
-}
-
-#[test]
-fn create_new_file_then_read_returns_new_content() {
-    let img = build_underlay_image();
-    let tf = write_tempimg(&img);
-    let m = Mount::open_direct(tf.path()).expect("open");
+fn a_created_file_is_readable_and_absent_from_the_underlay() {
+    let Some((m, _)) = open_fixture() else { return };
 
     m.overlay
         .create_file("/fresh.txt", b"fresh content".to_vec(), 0o100644);
-    let content = m.read_path("/fresh.txt").expect("read fresh");
-    assert_eq!(content, b"fresh content".to_vec());
-
-    // Underlay-side lookup should fail (the file never existed there).
-    assert!(m.fs.lookup_path("/fresh.txt").is_err());
-}
-
-#[test]
-fn delete_file_makes_reads_fail_with_not_found() {
-    let img = build_underlay_image();
-    let tf = write_tempimg(&img);
-    let m = Mount::open_direct(tf.path()).expect("open");
-
-    m.overlay.delete("/hello.txt");
-    let err = m.read_path("/hello.txt").unwrap_err();
-    assert_eq!(err, "not found");
-}
-
-#[test]
-fn rename_moves_underlay_file_via_overlay() {
-    let img = build_underlay_image();
-    let tf = write_tempimg(&img);
-    let m = Mount::open_direct(tf.path()).expect("open");
-
-    // Stage source by reading the underlay then creating-at-dest +
-    // deleting-source — mirrors what the WinFsp `rename` callback does.
-    let src = m.read_path("/hello.txt").expect("read src");
-    m.overlay.create_file("/renamed.txt", src.clone(), 0o100644);
-    m.overlay.delete("/hello.txt");
-
-    assert_eq!(m.read_path("/renamed.txt").expect("read dst"), src);
-    assert_eq!(m.read_path("/hello.txt").unwrap_err(), "not found");
-}
-
-#[test]
-fn dismount_discard_resets_overlay_state() {
-    let img = build_underlay_image();
-    let tf = write_tempimg(&img);
-    let m = Mount::open_direct(tf.path())
-        .expect("open")
-        .with_dismount_policy(DismountPolicy::Discard);
-
-    m.overlay
-        .create_file("/scratch.txt", b"x".to_vec(), 0o100644);
-    m.overlay.delete("/hello.txt");
-    assert!(m.overlay.changes_count() > 0);
-    m.apply_dismount_policy().expect("apply discard");
-    assert_eq!(m.overlay.changes_count(), 0);
-    // Underlay-only contents visible again.
     assert_eq!(
-        m.read_path("/hello.txt").expect("post-discard read"),
-        b"hi from underlay\n".to_vec()
+        m.read_path("/fresh.txt").expect("read the created file"),
+        b"fresh content"
     );
-}
-
-#[cfg(feature = "overlay-sidecar")]
-#[test]
-fn dismount_sidecar_writes_json_with_expected_schema() {
-    let img = build_underlay_image();
-    let tf = write_tempimg(&img);
-    let sidecar_dir = tempfile::tempdir().expect("tempdir");
-    let sidecar_path = sidecar_dir.path().join("overlay.json");
-    let m = Mount::open_direct(tf.path())
-        .expect("open")
-        .with_dismount_policy(DismountPolicy::Sidecar(sidecar_path.clone()));
-
-    m.overlay
-        .create_file("/new.txt", b"created".to_vec(), 0o100644);
-    m.overlay.delete("/hello.txt");
-    m.apply_dismount_policy().expect("apply sidecar");
-
-    let raw = std::fs::read(&sidecar_path).expect("read sidecar");
-    let json: serde_json::Value = serde_json::from_slice(&raw).expect("parse json");
-    let arr = json.as_array().expect("array");
-    let by_path: BTreeMap<String, &serde_json::Value> = arr
-        .iter()
-        .filter_map(|tuple| {
-            let parts = tuple.as_array()?;
-            let path = parts.get(0)?.as_str()?.to_string();
-            Some((path, parts.get(1)?))
-        })
-        .collect();
-    assert!(by_path.contains_key("/new.txt"));
-    assert!(by_path.contains_key("/hello.txt"));
-    // Tombstone surfaces as the bare string "Deleted" (serde's default
-    // tagging for unit variants).
-    let hello = by_path["/hello.txt"];
     assert!(
-        hello.as_str() == Some("Deleted") || hello.is_object(),
-        "expected Deleted tag, got {hello:?}"
+        m.fs.open("/fresh.txt").is_err(),
+        "a file that only exists in the overlay must not resolve in the underlay"
     );
 }
 
-#[cfg(not(feature = "overlay-sidecar"))]
 #[test]
-fn dismount_sidecar_without_feature_errors_clearly() {
-    let img = build_underlay_image();
-    let tf = write_tempimg(&img);
-    let sidecar_dir = tempfile::tempdir().expect("tempdir");
-    let sidecar_path = sidecar_dir.path().join("overlay.json");
-    let m = Mount::open_direct(tf.path())
-        .expect("open")
-        .with_dismount_policy(DismountPolicy::Sidecar(sidecar_path.clone()));
-    m.overlay
-        .create_file("/new.txt", b"created".to_vec(), 0o100644);
-    let err = m
-        .apply_dismount_policy()
-        .expect_err("sidecar without feature must error");
-    let msg = format!("{err:#}");
+fn a_deleted_file_stops_resolving() {
+    let Some((m, img)) = open_fixture() else {
+        return;
+    };
+
+    m.overlay.delete(KNOWN_FILE);
+    assert_eq!(
+        m.read_path(KNOWN_FILE).unwrap_err(),
+        "not found",
+        "a tombstoned path must read as missing, not as its underlay content"
+    );
+
+    // And the image still has it.
+    let untouched = mount(&img);
     assert!(
-        msg.contains("overlay-sidecar"),
-        "expected feature-gate hint in error, got: {msg}"
+        untouched.open(KNOWN_FILE).is_ok(),
+        "deleting through the overlay must not remove the file from the image"
     );
-    // No sidecar file should have been created.
-    assert!(!sidecar_path.exists());
 }
 
 #[test]
-fn dismount_rebuild_emits_new_image_with_merged_tree() {
-    let img = build_underlay_image();
-    let tf = write_tempimg(&img);
-    let out_dir = tempfile::tempdir().expect("tempdir");
-    let out_path = out_dir.path().join("rebuilt.img");
-    let m = Mount::open_direct(tf.path())
-        .expect("open")
-        .with_dismount_policy(DismountPolicy::Rebuild(out_path.clone()));
+fn a_rename_moves_the_file_within_the_overlay() {
+    let Some((m, _)) = open_fixture() else { return };
 
-    // Mutations to commit:
-    //  - Modify /hello.txt (truncate-then-write to mirror Explorer's
-    //    overwrite-in-place sequence)
-    //  - Create /fresh.txt
-    //  - Delete /dir/inner.txt
-    m.set_size_path("/hello.txt", 0).expect("truncate");
-    m.write_path("/hello.txt", 0, b"REBUILT\n").expect("write");
     m.overlay
-        .create_file("/fresh.txt", b"new\n".to_vec(), 0o100644);
-    m.overlay.delete("/dir/inner.txt");
-
-    m.apply_dismount_policy().expect("apply rebuild");
-    assert!(out_path.exists(), "rebuilt image must exist on disk");
-
-    // Open the rebuilt image and assert the merged tree is present.
-    let dev = fs_core::FileDevice::open(&out_path).expect("open rebuilt");
-    use std::sync::Arc;
-    let dev: Arc<dyn fs_core::BlockRead> = Arc::new(dev);
-    let rebuilt = Filesystem::open(dev).expect("reopen rebuilt");
-
-    let hello = rebuilt.lookup_path("/hello.txt").expect("hello");
-    let mut buf = vec![0u8; hello.size as usize];
-    rebuilt.read_file(&hello, 0, &mut buf).expect("read");
-    assert_eq!(buf, b"REBUILT\n".to_vec());
-
-    let fresh = rebuilt.lookup_path("/fresh.txt").expect("fresh");
-    let mut buf = vec![0u8; fresh.size as usize];
-    rebuilt.read_file(&fresh, 0, &mut buf).expect("read fresh");
-    assert_eq!(buf, b"new\n".to_vec());
-
-    // Deleted entry must be gone in the rebuild.
-    assert!(rebuilt.lookup_path("/dir/inner.txt").is_err());
+        .rename(KNOWN_FILE, "/renamed.txt")
+        .expect("rename an underlay file through the overlay");
+    assert_eq!(
+        m.read_path("/renamed.txt").expect("read at the new name"),
+        KNOWN_BYTES,
+        "the content should follow the rename"
+    );
+    assert!(
+        m.read_path(KNOWN_FILE).is_err(),
+        "the old name must stop resolving"
+    );
 }
 
 #[test]
-fn dismount_rebuild_round_trip_preserves_unchanged_files() {
-    let img = build_underlay_image();
-    let tf = write_tempimg(&img);
-    let out_dir = tempfile::tempdir().expect("tempdir");
-    let out_path = out_dir.path().join("rebuilt.img");
-    let m = Mount::open_direct(tf.path())
-        .expect("open")
-        .with_dismount_policy(DismountPolicy::Rebuild(out_path.clone()));
-    // No mutations at all — rebuild emits a faithful copy of the
-    // underlay's regular-file + dir tree.
-    m.apply_dismount_policy().expect("apply rebuild");
+fn discarding_on_dismount_drops_every_staged_change() {
+    let Some((m, _)) = open_fixture() else { return };
 
-    let dev = fs_core::FileDevice::open(&out_path).expect("open rebuilt");
-    use std::sync::Arc;
-    let dev: Arc<dyn fs_core::BlockRead> = Arc::new(dev);
-    let rebuilt = Filesystem::open(dev).expect("reopen rebuilt");
-    let hello = rebuilt.lookup_path("/hello.txt").expect("hello");
-    let mut buf = vec![0u8; hello.size as usize];
-    rebuilt.read_file(&hello, 0, &mut buf).expect("read");
-    assert_eq!(buf, b"hi from underlay\n".to_vec());
-    let inner = rebuilt.lookup_path("/dir/inner.txt").expect("inner");
-    let mut buf = vec![0u8; inner.size as usize];
-    rebuilt.read_file(&inner, 0, &mut buf).expect("read inner");
-    assert_eq!(buf, b"inner\n".to_vec());
+    m.write_path(KNOWN_FILE, 0, b"XX").expect("stage a write");
+    m.overlay
+        .create_file("/gone.txt", b"vanishes".to_vec(), 0o100644);
+
+    let m = m.with_dismount_policy(DismountPolicy::Discard);
+    m.apply_dismount_policy().expect("discard");
+
+    assert_eq!(
+        m.read_path(KNOWN_FILE).expect("read after discard"),
+        KNOWN_BYTES,
+        "a discarded write should leave the underlay content showing"
+    );
+    assert!(
+        m.read_path("/gone.txt").is_err(),
+        "a discarded creation should not survive"
+    );
+}
+
+/// Nested paths, so the overlay is exercised past a single directory
+/// level — a path-joining bug shows up here and not in the root.
+#[test]
+fn the_overlay_handles_nested_paths() {
+    let Some((m, _)) = open_fixture() else { return };
+    const NESTED: &str = "/dir/nested/deep/leaf.txt";
+
+    assert_eq!(m.read_path(NESTED).expect("read nested"), b"level three");
+
+    m.set_size_path(NESTED, 0).expect("truncate nested");
+    m.write_path(NESTED, 0, b"replaced").expect("write nested");
+    assert_eq!(m.read_path(NESTED).expect("read back"), b"replaced");
+
+    // A sibling in the same directory is unaffected.
+    assert_eq!(
+        m.read_path("/dir/one.txt").expect("read the sibling"),
+        b"level one",
+        "staging one file must not disturb another in the same directory"
+    );
+}
+
+/// A write past the end of a file zero-fills the gap rather than leaving
+/// whatever was in memory.
+#[test]
+fn writing_past_the_end_zero_fills() {
+    let Some((m, _)) = open_fixture() else { return };
+
+    m.write_path(KNOWN_FILE, 32, b"far")
+        .expect("write past EOF");
+    let content = m.read_path(KNOWN_FILE).expect("read back");
+
+    assert_eq!(content.len(), 35, "the file should have grown to fit");
+    assert_eq!(
+        &content[..KNOWN_BYTES.len()],
+        KNOWN_BYTES,
+        "the original bytes stay"
+    );
+    assert!(
+        content[KNOWN_BYTES.len()..32].iter().all(|&b| b == 0),
+        "the gap must be zeros, not uninitialised memory"
+    );
+    assert_eq!(&content[32..], b"far");
+}
+
+/// Writing to a directory is refused rather than corrupting the overlay.
+#[test]
+fn writing_to_a_directory_is_refused() {
+    let Some((m, _)) = open_fixture() else { return };
+    assert!(
+        m.write_path("/dir", 0, b"nope").is_err(),
+        "a directory is not writable as a file"
+    );
 }

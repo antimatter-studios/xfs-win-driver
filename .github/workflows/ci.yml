@@ -97,6 +97,84 @@ jobs:
       - run: cargo clippy --locked --no-default-features --all-targets -- -D warnings
       - run: cargo test --locked --no-default-features
 
+  # Real XFS filesystems, made by mkfs.xfs and populated by the kernel.
+  #
+  # This is the job that makes the integration tests mean anything. They
+  # used to run against an image hand-built by code copied from
+  # erofs-win-driver, which wrote an EROFS superblock -- so XFS read
+  # offset 0, found zeros, and every one of them failed. Gating them
+  # quietened the failure without making the tests true.
+  #
+  # It has to be Linux: mkfs.xfs is Linux-only, and populating the image
+  # means loop-mounting it, which needs root. A developer on macOS gets
+  # the skip message from tests/common/mod.rs instead, and it says how to
+  # build one.
+  fixtures:
+    name: test against a real XFS filesystem
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: check out sibling repos
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64)   asset="chore-0.9.0-linux-x86_64.tar.gz" ;;
+            Linux-aarch64)  asset="chore-0.9.0-linux-arm64.tar.gz" ;;
+            *) echo "unexpected runner $(uname -s)-$(uname -m)" >&2; exit 1 ;;
+          esac
+          curl -fsSL "https://github.com/antimatter-studios/chore/releases/download/v0.9.0/$asset" \
+            | sudo tar xz -C /usr/local/bin chore
+          chore siblings
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # xfsprogs provides mkfs.xfs. Print the version: which geometries
+      # and features it produces depends on it, so a failure that only
+      # happens here is worth being able to date.
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xfsprogs
+          mkfs.xfs -V
+
+      - name: Build the fixture
+        run: sudo scripts/build-fixtures.sh .fixtures
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: fixtures-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # XFS_TEST_IMAGE is explicit rather than relying on the .fixtures
+      # fallback, so a path change breaks loudly here instead of silently
+      # sending every test down the skip branch.
+      - name: Run the tests against it
+        env:
+          XFS_TEST_IMAGE: ${{ github.workspace }}/.fixtures/xfs-content.img
+        run: cargo test --locked --no-default-features -- --nocapture
+
+      # A skip is not a pass. If the fixture is present and something
+      # still skipped, the locator is broken and the suite is quietly
+      # proving less than it claims.
+      - name: Fail if anything skipped
+        env:
+          XFS_TEST_IMAGE: ${{ github.workspace }}/.fixtures/xfs-content.img
+        run: |
+          set -euo pipefail
+          out=$(cargo test --locked --no-default-features -- --nocapture 2>&1)
+          if echo "$out" | grep -q "SKIPPED"; then
+            echo "$out" | grep "SKIPPED"
+            echo "::error::tests skipped despite a fixture being present"
+            exit 1
+          fi
+          echo "no tests skipped"
+
   # The half that only exists on Windows, and the reason this file is
   # worth its runtime.
   windows:
