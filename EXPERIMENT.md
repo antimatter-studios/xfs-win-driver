@@ -145,6 +145,21 @@ They are kept because the tests are sound and only the fixture is
 missing. When `mkfs.xfs` exists, enable the feature and they should
 build unchanged.
 
+### One claim in an earlier draft of this file was simply wrong
+
+It said XFS has no ranged read, and that the WinFsp `read` callback
+therefore had to fetch the whole file and slice it. `Filesystem::read_at`
+is public and is exactly a ranged read; `read_file` is a thin wrapper
+over it with offset 0. The port had reached for the wrapper, and the
+note explained a limitation that did not exist.
+
+Left as a lesson rather than quietly corrected, because the shape
+recurs: a confident comment about *why* something must be done a certain
+way is worth checking against the callee, especially in a file produced
+by renaming another driver. The cost here would have been real — reading
+the whole file on every callback is O(size) per read and quadratic over
+a sequential scan.
+
 **So the honest status: the driver compiles and its logic is covered
 only where a fixture is not required.** Whether it mounts an XFS volume
 on Windows is untested and unclaimed.
