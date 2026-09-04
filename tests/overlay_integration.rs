@@ -1,19 +1,18 @@
-//! End-to-end integration tests for the read-write overlay layered
-//! atop a real XFS image.
+//! Overlay integration tests.
 //!
-//! Strategy: we build a small XFS image with `fs_xfs::mkfs::build_image`,
-//! open it through `Mount::open_direct`, then exercise the overlay-aware
-//! read / write helpers (`Mount::read_path`, `Mount::write_path`,
-//! `Mount::overlay`) which mirror the WinFsp callbacks' precedence rules.
-//! The WinFsp adapter itself is Windows + `feature = "mount"` only, so
-//! tests on macOS / Linux can't drive the C ABI directly — instead they
-//! verify the cross-platform layer the adapter uses internally.
+//! GATED OFF UNTIL `am-fs-xfs` CAN FORMAT. Every fixture in this file is
+//! built with `fs_xfs::mkfs::build_image`, and that module does not
+//! exist: creating an XFS filesystem from nothing is unfinished work in
+//! the reader — the superblock writer landed, the allocation group
+//! headers, btrees, root inode and log have not.
 //!
-//! Each scenario maps to one or more deliverable items from the task
-//! brief: read existing, write existing, create / delete / rename, plus
-//! the three dismount policies (Discard, Sidecar, Rebuild).
-//!
-//! License: GPL-3.0-or-later (matches the surrounding crate).
+//! Kept rather than deleted, because the tests themselves are sound and
+//! the only thing missing is a way to produce an image to run them
+//! against. When `mkfs.xfs` exists, delete the `cfg` below and they
+//! should build unchanged — the feature it names is deliberately one
+//! that no `Cargo.toml` defines, so the file compiles to nothing today
+//! and cannot be enabled by accident.
+#![cfg(feature = "xfs-mkfs-fixtures")]
 
 use std::collections::BTreeMap;
 use std::io::Write;

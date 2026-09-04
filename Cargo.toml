@@ -71,6 +71,17 @@ winfsp = { path = "../winfsp-rs/winfsp", features = ["delayload"], default-featu
 
 [features]
 default = []
+# Tests that need a real XFS image to run against. OFF, and cannot be
+# turned on usefully yet: every fixture behind it is built with
+# `fs_xfs::mkfs::build_image`, and am-fs-xfs has no mkfs module --
+# creating an XFS filesystem from nothing is unfinished work there (the
+# superblock writer landed; AG headers, btrees, root inode and log have
+# not).
+#
+# The tests are kept rather than deleted because they are sound; only
+# the fixture is missing. When mkfs.xfs exists, enable this and they
+# should build unchanged.
+xfs-mkfs-fixtures = []
 # Enables the `mount` subcommand (WinFsp driver). Active only on Windows
 # — on other targets the deps don't resolve and the cfg-gated code is
 # absent.
