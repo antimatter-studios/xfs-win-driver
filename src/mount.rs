@@ -507,7 +507,9 @@ mod winfsp_adapter {
     // is in scope on x64 / arm64 builds).
     use winfsp_sys::{FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES};
 
-    use fs_xfs::{FileType, Filesystem, Inode};
+    use fs_xfs::dir::DirEntry as XfsDirEntry;
+    use fs_xfs::inode::{FileType, Inode};
+    use fs_xfs::Filesystem;
 
     use super::{Mount, OverlayEntry, OverlayLookup, WriteMode};
 
@@ -623,6 +625,27 @@ mod winfsp_adapter {
         info.ea_size = 0;
     }
 
+    /// Read a whole file, fetching the raw inode fork alongside it.
+    ///
+    /// XFS threads the raw bytes through `read_file` because an inode
+    /// keeps its extents and inline data in that fork. `lookup_path`
+    /// has already read and discarded them, so this is a second read --
+    /// the cost a handle-style reader API would remove.
+    fn read_whole(fs: &Filesystem, inode: &Inode) -> FspResult<Vec<u8>> {
+        let (inode, raw) = fs.read_inode_raw(inode.ino).map_err(err_to_status)?;
+        fs.read_file(&inode, &raw)
+            .map_err(|e| err_to_status(e).into())
+    }
+
+    /// List a directory, fetching the raw inode fork alongside it.
+    /// Short-form directories store their entries inside the inode, so
+    /// the parsed struct alone is not enough.
+    fn read_children(fs: &Filesystem, inode: &Inode) -> FspResult<Vec<XfsDirEntry>> {
+        let (inode, raw) = fs.read_inode_raw(inode.ino).map_err(err_to_status)?;
+        fs.read_dir(&inode, &raw)
+            .map_err(|e| err_to_status(e).into())
+    }
+
     /// Map an `fs_xfs::Error` to an NTSTATUS suitable for returning
     /// from a WinFsp callback. Most lookup-style failures collapse to
     /// `STATUS_OBJECT_NAME_NOT_FOUND` — Explorer / consumer apps treat
@@ -632,7 +655,12 @@ mod winfsp_adapter {
     fn err_to_status(err: fs_xfs::Error) -> windows::Win32::Foundation::NTSTATUS {
         use fs_xfs::Error as E;
         match err {
-            E::NotFound | E::NotADirectory | E::BadDirent(_) => STATUS_OBJECT_NAME_NOT_FOUND,
+            // No BadDirent: XFS's error type has no dirent-specific
+            // corruption variant, unlike EROFS's. NotAFile joins the
+            // lookup-style failures for the same reason the others do --
+            // to a caller they all mean "that path is not what you
+            // asked for".
+            E::NotFound | E::NotADirectory | E::NotAFile => STATUS_OBJECT_NAME_NOT_FOUND,
             _ => STATUS_INVALID_DEVICE_REQUEST,
         }
     }
@@ -670,7 +698,7 @@ mod winfsp_adapter {
     impl XfsContext {
         pub fn new(mount: Mount) -> Result<Self> {
             let sb = mount.fs.superblock();
-            let label = sb.volume_name_str().to_string();
+            let label = sb.fname.clone();
             let total_size = sb.dblocks * u64::from(sb.blocksize);
             Ok(Self {
                 mount,
@@ -735,12 +763,7 @@ mod winfsp_adapter {
                     if !inode.is_regular_file() {
                         return Err(STATUS_INVALID_DEVICE_REQUEST.into());
                     }
-                    let mut buf = vec![0u8; inode.size as usize];
-                    if !buf.is_empty() {
-                        self.fs()
-                            .read_file(&inode, 0, &mut buf)
-                            .map_err(|e| err_to_status(e))?;
-                    }
+                    let buf = read_whole(self.fs(), &inode)?;
                     Ok((buf, inode.mode))
                 }
             }
@@ -903,10 +926,16 @@ mod winfsp_adapter {
             }
             let remaining = inode.size - offset;
             let take = (buffer.len() as u64).min(remaining) as usize;
-            self.fs()
-                .read_file(&inode, offset, &mut buffer[..take])
-                .map_err(|e| err_to_status(e))?;
-            Ok(take as u32)
+            // XFS's read_file has no offset form -- it returns the whole
+            // file -- so the range is taken here. Fine for an escape
+            // hatch; a driver serving large files would want the reader
+            // to grow a ranged read rather than paying this per call.
+            let whole = read_whole(self.fs(), &inode)?;
+            let from = offset as usize;
+            let end = (from + take).min(whole.len());
+            let n = end.saturating_sub(from);
+            buffer[..n].copy_from_slice(&whole[from..end]);
+            Ok(n as u32)
         }
 
         fn read_directory(
@@ -933,7 +962,7 @@ mod winfsp_adapter {
             let underlay_inode = context.inode.lock().unwrap().clone();
             let mut underlay_pairs: Vec<(String, Inode)> = Vec::new();
             if let Some(inode) = underlay_inode.as_ref() {
-                if let Ok(children) = self.fs().read_dir(inode) {
+                if let Ok(children) = read_children(self.fs(), inode) {
                     for e in children {
                         if e.name == b"." || e.name == b".." {
                             continue;
@@ -1275,13 +1304,7 @@ mod winfsp_adapter {
                     if inode.is_dir() {
                         (Vec::new(), inode.mode, true)
                     } else if inode.is_regular_file() {
-                        let mut buf = vec![0u8; inode.size as usize];
-                        if !buf.is_empty() {
-                            self.fs()
-                                .read_file(&inode, 0, &mut buf)
-                                .map_err(|e| err_to_status(e))?;
-                        }
-                        (buf, inode.mode, false)
+                        (read_whole(self.fs(), &inode)?, inode.mode, false)
                     } else {
                         return Err(STATUS_INVALID_DEVICE_REQUEST.into());
                     }
