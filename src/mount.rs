@@ -256,10 +256,11 @@ impl Mount {
     /// every read here is really two: resolve, then re-fetch.
     ///
     /// `lookup_path` has already read those bytes and discarded them,
-    /// which is the waste a handle-style API would remove (a `File`
-    /// would hold them from the lookup onward). Until that exists this
-    /// is one helper rather than the same three lines at five call
-    /// sites.
+    /// which is the waste `Filesystem::open` removes -- a `File` holds
+    /// the fork from the lookup onward. Callers that resolve a path and
+    /// then read it should use that instead. This helper stays for the
+    /// callers that already hold an `Inode` (the WinFsp context caches
+    /// one) and so have nothing left to open from.
     fn read_whole(&self, inode: &Inode) -> std::result::Result<Vec<u8>, &'static str> {
         let (inode, raw) = self
             .fs
@@ -351,6 +352,82 @@ impl Mount {
         };
         content.resize(new_size as usize, 0);
         self.overlay.write_file(unix_path, content, mode);
+        Ok(())
+    }
+
+    /// Rename `from` to `to`, staged entirely in the overlay.
+    ///
+    /// `Overlay::rename` deliberately refuses a source it has no entry
+    /// for -- it moves overlay state and knows nothing about the image.
+    /// Most renames a user performs are exactly that case, though: the
+    /// file exists only in the underlay and has never been written to.
+    /// So the source is read out of the image first and staged at the
+    /// destination, and the old path is tombstoned.
+    ///
+    /// A directory renames as an empty `CreatedDir`, which is a real
+    /// limitation and not an oversight: the children keep resolving at
+    /// their old paths through the underlay, so a renamed directory
+    /// appears empty. Recursive restaging is the fix, and it is not
+    /// written yet.
+    ///
+    /// This lived inside the `cfg(windows)` WinFsp `rename` callback,
+    /// where nothing off Windows could reach it -- so the one operation
+    /// with real underlay-to-overlay promotion logic was the one
+    /// operation with no portable test. The callback now calls this.
+    pub fn rename_path(
+        &self,
+        from: &str,
+        to: &str,
+        replace_if_exists: bool,
+    ) -> std::result::Result<(), &'static str> {
+        if from == to {
+            return Ok(());
+        }
+
+        // Resolve the source content, promoting from the underlay when
+        // the overlay has never seen it.
+        let (content, mode, is_dir) = match self.overlay.lookup(from) {
+            OverlayLookup::Hit(OverlayEntry::Created { content, mode, .. })
+            | OverlayLookup::Hit(OverlayEntry::Modified { content, mode, .. }) => {
+                (content, mode, false)
+            }
+            OverlayLookup::Hit(OverlayEntry::CreatedDir { mode, .. }) => (Vec::new(), mode, true),
+            OverlayLookup::Hit(OverlayEntry::Deleted) | OverlayLookup::Deleted => {
+                return Err("rename: source not found")
+            }
+            OverlayLookup::Miss => {
+                let inode = self
+                    .fs
+                    .lookup_path(from)
+                    .map_err(|_| "rename: source not found")?;
+                if inode.is_dir() {
+                    (Vec::new(), inode.mode, true)
+                } else if inode.is_regular_file() {
+                    (self.read_whole(&inode)?, inode.mode, false)
+                } else {
+                    return Err("rename: source is not a file or directory");
+                }
+            }
+        };
+
+        // A tombstone at the destination means it was deleted through
+        // the overlay, so the name is free even though the image still
+        // has it -- checking the underlay here would resurrect it.
+        let dest_exists = match self.overlay.lookup(to) {
+            OverlayLookup::Hit(OverlayEntry::Deleted) | OverlayLookup::Deleted => false,
+            OverlayLookup::Hit(_) => true,
+            OverlayLookup::Miss => self.fs.lookup_path(to).is_ok(),
+        };
+        if dest_exists && !replace_if_exists {
+            return Err("rename: destination exists");
+        }
+
+        if is_dir {
+            self.overlay.create_dir(to, mode);
+        } else {
+            self.overlay.create_file(to, content, mode);
+        }
+        self.overlay.delete(from);
         Ok(())
     }
 
@@ -1285,50 +1362,20 @@ mod winfsp_adapter {
             let from = winpath_to_unix(file_name).map_err(|_| STATUS_OBJECT_NAME_NOT_FOUND)?;
             let to = winpath_to_unix(new_file_name).map_err(|_| STATUS_OBJECT_NAME_NOT_FOUND)?;
 
-            // Resolve source content.
-            let (content, mode, is_dir) = match self.mount.overlay.lookup(&from) {
-                OverlayLookup::Hit(OverlayEntry::Created { content, mode, .. })
-                | OverlayLookup::Hit(OverlayEntry::Modified { content, mode, .. }) => {
-                    (content, mode, false)
-                }
-                OverlayLookup::Hit(OverlayEntry::CreatedDir { mode, .. }) => {
-                    (Vec::new(), mode, true)
-                }
-                // Same caveat as in read_full: `Hit(Deleted)` is
-                // type-reachable but `lookup` collapses it into the
-                // top-level `Deleted`. Either way the source is gone.
-                OverlayLookup::Hit(OverlayEntry::Deleted) | OverlayLookup::Deleted => {
-                    return Err(STATUS_OBJECT_NAME_NOT_FOUND.into());
-                }
-                OverlayLookup::Miss => {
-                    let inode = self.fs().lookup_path(&from).map_err(|e| err_to_status(e))?;
-                    if inode.is_dir() {
-                        (Vec::new(), inode.mode, true)
-                    } else if inode.is_regular_file() {
-                        (read_whole(self.fs(), &inode)?, inode.mode, false)
-                    } else {
-                        return Err(STATUS_INVALID_DEVICE_REQUEST.into());
-                    }
-                }
-            };
-
-            // Existence check at destination.
-            let dest_exists = match self.mount.overlay.lookup(&to) {
-                OverlayLookup::Hit(_) => true,
-                OverlayLookup::Deleted => false,
-                OverlayLookup::Miss => self.fs().lookup_path(&to).is_ok(),
-            };
-            if dest_exists && !replace_if_exists {
-                return Err(STATUS_OBJECT_NAME_COLLISION.into());
-            }
-
-            // Stage: create destination + tombstone source.
-            if is_dir {
-                self.mount.overlay.create_dir(&to, mode);
-            } else {
-                self.mount.overlay.create_file(&to, content, mode);
-            }
-            self.mount.overlay.delete(&from);
+            // The promotion logic used to live here, which put the one
+            // write operation that reads from the underlay out of reach
+            // of every non-Windows test. It is `Mount::rename_path` now;
+            // this maps its errors onto the statuses WinFsp expects.
+            self.mount
+                .rename_path(&from, &to, replace_if_exists)
+                .map_err(|e| match e {
+                    "rename: destination exists" => STATUS_OBJECT_NAME_COLLISION,
+                    // Same split `err_to_status` makes: a path problem
+                    // reads as not-found, anything else as a device
+                    // error. "underlay read error" lands in the second.
+                    "rename: source not found" => STATUS_OBJECT_NAME_NOT_FOUND,
+                    _ => STATUS_INVALID_DEVICE_REQUEST,
+                })?;
             Ok(())
         }
 
@@ -1503,202 +1550,23 @@ pub use winfsp_adapter::run as run_winfsp;
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
-mod tests {
-    //! Smoke tests for the `Mount` open path. The full WinFsp
-    //! callback flow is `#[cfg(all(windows, feature = "mount"))]` and
-    //! requires the WinFsp DLL to be installed on the host, so it's
-    //! ignored on every target except Windows-with-WinFsp.
-    //!
-    //! What we *can* test cross-platform: that `Mount::open` works on
-    //! an XFS image (built inline byte-for-byte from the spec, so
-    //! the test stays decoupled from the `am_fs_xfs::mkfs` builder)
-    //! and that the resulting `Filesystem` exposes the basic info needed
-    //! to populate `VolumeInfo` and a directory listing.
-
-    // `super::*` is only needed by the image-fixture tests, which are
-    // gated until am-fs-xfs can format. The tests that remain are pure
-    // and name what they use.
-    #[cfg(feature = "xfs-mkfs-fixtures")]
-    use super::*;
-    #[cfg(feature = "xfs-mkfs-fixtures")]
-    use std::io::Write;
-
-    /// Gated with the fixture it exists to write out.
-    #[cfg(feature = "xfs-mkfs-fixtures")]
-    fn write_tempimg(bytes: &[u8]) -> tempfile::NamedTempFile {
-        let mut tf = tempfile::NamedTempFile::new().expect("tempfile");
-        tf.write_all(bytes).expect("write");
-        tf.flush().expect("flush");
-        tf
-    }
-
-    /// Build a minimal valid XFS image manually. Mirrors the layout
-    /// used by `fs_xfs::fs::tests::build_image`:
-    ///   - 4 KiB blocks, root NID = 0, meta_blkaddr = 1
-    ///   - root dir at NID 0 (FLAT_PLAIN, mode = 0o041xx, dir block = 3)
-    ///   - regular file at NID 1 ("hello.txt", FLAT_PLAIN, file data at block 2)
-    ///
-    /// Hand-rolled here so the smoke tests don't depend on the
-    /// `am_fs_xfs::mkfs` builder, which is mid-refactor in this
-    /// workspace and not always compilable. Field offsets / magic
-    /// constants come from the `xfs_fs.h` spec (also documented in
-    /// `am_fs_xfs::superblock`, `inode`, and `dir`).
-    /// Hand-built image fixture, inherited from the EROFS driver this
-    /// was ported from and therefore NOT a valid XFS volume — it writes
-    /// an EROFS superblock at EROFS's offset, so XFS reads offset 0 and
-    /// sees zeros. Gated with its callers until there is an XFS
-    /// formatter to replace it.
-    #[cfg(feature = "xfs-mkfs-fixtures")]
-    fn build_simple_image() -> Vec<u8> {
-        const BS: usize = 4096;
-        const SUPER_OFFSET: usize = 1024;
-        let mut img = vec![0u8; BS * 4];
-
-        // -- Superblock at offset 1024 --------------------------------------
-        img[SUPER_OFFSET..SUPER_OFFSET + 4].copy_from_slice(&0xE0F5_E1E2u32.to_le_bytes());
-        // checksum=0, feature_compat=0
-        img[SUPER_OFFSET + 0x0C] = 12; // blkszbits = 12 (4 KiB)
-                                       // sb_extslots=0
-        img[SUPER_OFFSET + 0x0E..SUPER_OFFSET + 0x10].copy_from_slice(&0u16.to_le_bytes()); // root_nid
-        img[SUPER_OFFSET + 0x10..SUPER_OFFSET + 0x18].copy_from_slice(&2u64.to_le_bytes()); // inos
-        img[SUPER_OFFSET + 0x24..SUPER_OFFSET + 0x28].copy_from_slice(&4u32.to_le_bytes()); // blocks
-        img[SUPER_OFFSET + 0x28..SUPER_OFFSET + 0x2C].copy_from_slice(&1u32.to_le_bytes()); // meta_blkaddr
-                                                                                            // volume_name @ 0x40 — leave zero / empty
-
-        // -- Root dir inode at NID 0 (offset = meta_blkaddr*BS + 0*32) -----
-        // Compact (32 byte) inode, FLAT_PLAIN layout, mode=S_IFDIR|0755,
-        // size=BS (one dir block), nlink=2, raw_blkaddr=3.
-        let raw_format: u16 = 0; // version=0 (compact), layout=FlatPlain (=0), <<1
-        img[BS..BS + 2].copy_from_slice(&raw_format.to_le_bytes());
-        img[BS + 0x04..BS + 0x06].copy_from_slice(&0o040755u16.to_le_bytes());
-        img[BS + 0x06..BS + 0x08].copy_from_slice(&2u16.to_le_bytes()); // nlink
-        img[BS + 0x08..BS + 0x0C].copy_from_slice(&(BS as u32).to_le_bytes()); // size
-        img[BS + 0x10..BS + 0x14].copy_from_slice(&3u32.to_le_bytes()); // raw_blkaddr
-
-        // -- File inode at NID 1 (offset = meta + 1*32) --------------------
-        let off = BS + 32;
-        img[off..off + 2].copy_from_slice(&raw_format.to_le_bytes());
-        img[off + 0x04..off + 0x06].copy_from_slice(&0o100644u16.to_le_bytes()); // S_IFREG|0644
-        img[off + 0x06..off + 0x08].copy_from_slice(&1u16.to_le_bytes()); // nlink
-        img[off + 0x08..off + 0x0C].copy_from_slice(&(b"hi from xfs\n".len() as u32).to_le_bytes());
-        img[off + 0x10..off + 0x14].copy_from_slice(&2u32.to_le_bytes()); // raw_blkaddr=2
-
-        // -- File data at block 2 ------------------------------------------
-        let payload = b"hi from xfs\n";
-        img[2 * BS..2 * BS + payload.len()].copy_from_slice(payload);
-
-        // -- Dir block at block 3: one entry "hello.txt" -> NID 1 ----------
-        // dirent header (12 bytes): nid, nameoff, file_type, reserved
-        // Single entry: names start immediately after the one dirent.
-        let dir = 3 * BS;
-        img[dir..dir + 8].copy_from_slice(&1u64.to_le_bytes()); // nid
-        let nameoff: u16 = 12;
-        img[dir + 8..dir + 10].copy_from_slice(&nameoff.to_le_bytes());
-        img[dir + 10] = 1; // FT_REG_FILE
-        let name = b"hello.txt";
-        img[dir + 12..dir + 12 + name.len()].copy_from_slice(name);
-
-        img
-    }
-
-    // Needs a real XFS image and there is no way to make one: the
-    // fixture below is the EROFS builder this driver was ported from,
-    // so XFS reads offset 0 and finds zeros. Building a valid XFS image
-    // by hand is the mkfs work that does not exist yet. Kept, not
-    // deleted -- the test is sound, the fixture is missing.
-    #[cfg(feature = "xfs-mkfs-fixtures")]
-    #[test]
-    fn mount_open_direct_smoke() {
-        let img = build_simple_image();
-        let tf = write_tempimg(&img);
-        let m = Mount::open(tf.path(), None).expect("open");
-        // Sanity: we can read the root and list entries.
-        let root = m.fs.root_inode().expect("root");
-        assert!(root.is_dir());
-        let (root, raw) = m.fs.read_inode_raw(root.ino).expect("root raw");
-        let entries = m.fs.read_dir(&root, &raw).expect("read_dir");
-        let names: Vec<&[u8]> = entries.iter().map(|e| e.name.as_slice()).collect();
-        assert!(
-            names.iter().any(|n| *n == b"hello.txt"),
-            "expected hello.txt in dir listing, got {names:?}"
-        );
-    }
-
-    // Needs a real XFS image and there is no way to make one: the
-    // fixture below is the EROFS builder this driver was ported from,
-    // so XFS reads offset 0 and finds zeros. Building a valid XFS image
-    // by hand is the mkfs work that does not exist yet. Kept, not
-    // deleted -- the test is sound, the fixture is missing.
-    #[cfg(feature = "xfs-mkfs-fixtures")]
-    #[test]
-    fn mount_open_part_zero_treated_as_direct() {
-        // `Some(0)` should behave identically to `None` — i.e. open the
-        // image as a single XFS volume with no partition slicing.
-        // The auto-mount watcher passes `--part 0` for whole-disk
-        // detections, so this is on the hot path.
-        let img = build_simple_image();
-        let tf = write_tempimg(&img);
-        let m = Mount::open(tf.path(), Some(0)).expect("open part=0");
-        let root = m.fs.root_inode().expect("root");
-        assert!(root.is_dir());
-    }
-
-    // Needs a real XFS image and there is no way to make one: the
-    // fixture below is the EROFS builder this driver was ported from,
-    // so XFS reads offset 0 and finds zeros. Building a valid XFS image
-    // by hand is the mkfs work that does not exist yet. Kept, not
-    // deleted -- the test is sound, the fixture is missing.
-    #[cfg(feature = "xfs-mkfs-fixtures")]
-    #[test]
-    fn volume_info_math_matches_superblock() {
-        // Mirror what the WinFsp `get_volume_info` callback computes,
-        // without needing to construct the full `XfsContext` (which
-        // is Windows-only). We assert the math: total_size = blocks
-        // * block_size; free_size = 0 (RO).
-        let img = build_simple_image();
-        let tf = write_tempimg(&img);
-        let m = Mount::open(tf.path(), None).expect("open");
-        let sb = m.fs.superblock();
-        let total = sb.dblocks * u64::from(sb.blocksize);
-        assert_eq!(total, 4 * 4096, "expected 16 KiB total, got {total}");
-        // RO surface — free is always zero.
-        let free: u64 = 0;
-        assert_eq!(free, 0);
-    }
-
-    // Shares the fixture above, so it is gated with it. This one would
-    // arguably pass regardless -- it asserts a FAILURE -- but passing
-    // for the wrong reason is worse than not running: an invalid image
-    // fails partition-open for reasons that have nothing to do with the
-    // range check it is meant to exercise.
-    #[cfg(feature = "xfs-mkfs-fixtures")]
-    #[test]
-    fn mount_open_partition_out_of_range_errors() {
-        // No partition table in our test image; asking for --part 1
-        // must fail gracefully (no partitions found, or out-of-range).
-        let img = build_simple_image();
-        let tf = write_tempimg(&img);
-        let r = Mount::open(tf.path(), Some(1));
-        assert!(
-            r.is_err(),
-            "expected partition open to fail on a non-partitioned image"
-        );
-    }
-
-    /// Full live-mount smoke test. Skipped everywhere except a Windows
-    /// host with WinFsp installed; even then only run with
-    /// `cargo test -- --ignored`. Kept here to document the intended
-    /// runtime invocation; CI gating happens in the harness.
-    #[cfg(all(windows, feature = "mount"))]
-    #[test]
-    #[ignore = "needs WinFsp installed; live drive-letter mount"]
-    fn full_winfsp_mount_smoke() {
-        let img = build_simple_image();
-        let tf = write_tempimg(&img);
-        let m = Mount::open(tf.path(), None).expect("open");
-        // Picks `Y:` arbitrarily for the test; the harness should
-        // ensure it's free before running.
-        let _ = m.run("Y:");
-    }
-}
+// NO UNIT TESTS IN THIS FILE, deliberately.
+//
+// It used to have four, built on a `build_simple_image()` inherited from
+// erofs-win-driver that wrote an EROFS superblock -- so XFS read offset
+// 0, found zeros, and every one of them failed. They were briefly gated
+// behind a feature flag, which quietened the failure without making the
+// tests true.
+//
+// Everything in this file needs a mounted filesystem, so the honest
+// place for its coverage is `tests/`, against images a real `mkfs.xfs`
+// produced (`scripts/build-fixtures.sh`). What the four covered is
+// covered there:
+//
+//   mount_open_direct_smoke               -> mount_open_reads_a_real_filesystem
+//   mount_open_part_zero_treated_as_direct-> a_partition_index_on_an_unpartitioned_image_is_refused
+//   volume_info_math_matches_superblock   -> volume_totals_match_the_superblock
+//   mount_open_partition_out_of_range     -> a_partition_index_on_an_unpartitioned_image_is_refused
+//
+// A unit test here would have to fake a filesystem, and a fake is what
+// got this file into trouble in the first place.

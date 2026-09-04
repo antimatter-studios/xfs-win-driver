@@ -6,4 +6,10 @@
 .history
 .test-env
 test-diagnostics/
-.claude/
+.claude/.fixtures/
+
+# Test fixtures: real XFS images built by scripts/build-fixtures.sh.
+# The *.img rule below already covers what the script writes, but naming
+# the directory means a non-image file dropped in here (a build log, a
+# manifest) is not swept into a commit by `git add -A`.
+.fixtures/

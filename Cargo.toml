@@ -26,7 +26,7 @@ clap = { version = "4", features = ["derive"] }
 # windows-only block.
 winfsp-fs-skeleton = { path = "../winfsp-fs-skeleton", default-features = false }
 am-fs-core = { path = "../rust-fs-core", version = "0.2" }
-am-fs-xfs = { path = "../rust-fs-xfs", version = "0.5" }
+am-fs-xfs = { path = "../rust-fs-xfs", version = "0.6" }
 # `watch` subcommand uses ctrlc on Windows. Pulled in unconditionally
 # (cheap, cross-platform) so the same handler code wires the foreground
 # `watch` and the WinFsp `mount` Ctrl-C path.
@@ -71,17 +71,6 @@ winfsp = { path = "../winfsp-rs/winfsp", features = ["delayload"], default-featu
 
 [features]
 default = []
-# Tests that need a real XFS image to run against. OFF, and cannot be
-# turned on usefully yet: every fixture behind it is built with
-# `fs_xfs::mkfs::build_image`, and am-fs-xfs has no mkfs module --
-# creating an XFS filesystem from nothing is unfinished work there (the
-# superblock writer landed; AG headers, btrees, root inode and log have
-# not).
-#
-# The tests are kept rather than deleted because they are sound; only
-# the fixture is missing. When mkfs.xfs exists, enable this and they
-# should build unchanged.
-xfs-mkfs-fixtures = []
 # Enables the `mount` subcommand (WinFsp driver). Active only on Windows
 # — on other targets the deps don't resolve and the cfg-gated code is
 # absent.

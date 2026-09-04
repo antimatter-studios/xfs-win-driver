@@ -31,7 +31,7 @@ vars:
   FS_CORE_URL: https://github.com/antimatter-studios/rust-fs-core.git
   FS_CORE_REF: v0.2.4
   FS_XFS_URL: https://github.com/antimatter-studios/rust-fs-xfs.git
-  FS_XFS_REF: v0.5.2
+  FS_XFS_REF: v0.6.0
   SKELETON_URL: https://github.com/antimatter-studios/winfsp-fs-skeleton.git
   SKELETON_REF: v0.2.1
   HARNESS_URL: https://github.com/antimatter-studios/fs-test-harness.git
