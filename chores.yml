@@ -34,8 +34,10 @@ vars:
   FS_XFS_REF: v0.6.0
   SKELETON_URL: https://github.com/antimatter-studios/winfsp-fs-skeleton.git
   SKELETON_REF: v0.2.1
-  HARNESS_URL: https://github.com/antimatter-studios/fs-test-harness.git
-  HARNESS_REF: v3.11.0
+  # fs-windows-test-harness, which fs-test-harness became at v4.0.0: the
+  # matrix runs through it, in CI as on a developer's Windows VM (#7).
+  HARNESS_URL: https://github.com/antimatter-studios/fs-windows-test-harness.git
+  HARNESS_REF: v4.3.1
   # Pinned to a commit, not a branch: this is the revision both other
   # drivers build against. Upstream 0.13.0 declares the guard-strategy
   # constant signed while bindgen emits it unsigned for the gnullvm
@@ -56,7 +58,7 @@ tasks:
           rust-fs-core       '{{.FS_CORE_URL}}'   '{{.FS_CORE_REF}}' \
           rust-fs-xfs        '{{.FS_XFS_URL}}'    '{{.FS_XFS_REF}}' \
           winfsp-fs-skeleton '{{.SKELETON_URL}}'  '{{.SKELETON_REF}}' \
-          fs-test-harness    '{{.HARNESS_URL}}'   '{{.HARNESS_REF}}' \
+          fs-windows-test-harness '{{.HARNESS_URL}}' '{{.HARNESS_REF}}' \
           winfsp-rs          '{{.WINFSP_RS_URL}}' '{{.WINFSP_RS_REF}}' \
         | while IFS="$(printf '\t')" read -r name url ref; do
             dir="../$name"
