@@ -1,128 +1,234 @@
 {
   "_format": "v2",
-  "_doc": "xfs-win-driver matrix. XFS is read-only natively, so coverage focuses on host-side info/ls/cat probes plus vm-side mount + readback. RW (overlay-sidecar) scenarios are deferred — they need a sidecar emit + replay op shape not present in the shared scripts/win/. Test images are built by fixtures/build-test-disks.sh into ../rust-fs-xfs/test-disks/. Hashes captured against the canonical xfs-basic.img produced by mkfs_xfs over a synthesised source tree.",
+  "_doc": "xfs-win-driver matrix (#7). Every scenario runs on xfs-content.img, made by scripts/build-fixtures.sh: mkfs.xfs -L DJTEST, then populated by the kernel with the files its comments describe. Host-side scenarios read it with xfs.exe; win-mount-* mount it read-only through WinFsp. Sizes and hashes are of the content that script writes.",
   "scenarios": {
     "basic-info-volume": {
       "status": "pending",
-      "image": "xfs-basic.img",
+      "image": "xfs-content.img",
       "_attempts": [],
-      "_notes": "Volume-level smoke. Asserts block_size + volume_name substrings so superblock decoding regressions trip a verdict. Capture: ./target/release/xfs info ../rust-fs-xfs/test-disks/xfs-basic.img",
+      "_notes": "The superblock as the driver reads it: block size and the label mkfs.xfs was given.",
       "recipe": [
+        {
+          "op": "build-xfs-image"
+        },
         {
           "op": "verify-info",
           "expect_args": "'--expect-stdout-contains' 'block size       4096'"
         },
         {
           "op": "verify-info",
-          "expect_args": "'--expect-stdout-contains' 'volume name      \"rsmkfs\"'"
+          "expect_args": "'--expect-stdout-contains' 'volume name      \"DJTEST\"'"
         }
       ]
     },
-    "basic-ro-list-root": {
+    "ro-list-root": {
       "status": "pending",
-      "image": "xfs-basic.img",
+      "image": "xfs-content.img",
       "_attempts": [],
-      "_notes": "Root-dir listing. Validates dirent decoding + name-set against the canonical xfs-basic.img source tree (test.txt, subdir/).",
+      "_notes": "The root directory: every entry scripts/build-fixtures.sh made, and nothing else (8 with the non-ASCII name, which is checked by count rather than spelled here).",
       "recipe": [
         {
-          "op": "verify-ls",
-          "path": "/",
-          "expect_args": "'--expect-name' '.' '--expect-name' '..' '--expect-name' 'subdir' '--expect-name' 'test.txt'"
+          "op": "build-xfs-image"
         },
         {
           "op": "verify-ls",
           "path": "/",
-          "expect_args": "'--expect-count' '4'"
-        }
-      ]
-    },
-    "basic-ro-list-subdir": {
-      "status": "pending",
-      "image": "xfs-basic.img",
-      "_attempts": [],
-      "_notes": "Subdirectory listing. Validates non-root dirent traversal.",
-      "recipe": [
+          "expect_args": "'--expect-name' 'small.txt' '--expect-name' 'empty.txt' '--expect-name' 'pattern.bin' '--expect-name' 'dir' '--expect-name' 'manyentries' '--expect-name' 'link-to-small' '--expect-name' 'dangling-link' '--expect-name' 'naïve-café.txt'"
+        },
         {
           "op": "verify-ls",
-          "path": "/subdir",
-          "expect_args": "'--expect-name' '.' '--expect-name' '..' '--expect-name' 'nested.txt'"
+          "path": "/",
+          "expect_args": "'--expect-count' '8'"
         }
       ]
     },
-    "basic-ro-cat-test-txt": {
+    "ro-list-nested": {
       "status": "pending",
-      "image": "xfs-basic.img",
+      "image": "xfs-content.img",
       "_attempts": [],
-      "_notes": "Read content matches sha256 on /test.txt. Capture: printf 'hello from xfs\\n' | shasum -a 256 -> 68f426e9...",
+      "_notes": "Three levels down, through two directories.",
       "recipe": [
         {
-          "op": "verify-cat",
-          "path": "/test.txt",
-          "expect_args": "'--expect-size' '17' '--expect-sha256' '68f426e9fbc8c7bb8ccb49037bc2aab582009cf499a57bffdf7b4971d9eef196'"
+          "op": "build-xfs-image"
+        },
+        {
+          "op": "verify-ls",
+          "path": "/dir/nested/deep",
+          "expect_args": "'--expect-name' 'leaf.txt'"
+        },
+        {
+          "op": "verify-ls",
+          "path": "/dir/nested/deep",
+          "expect_args": "'--expect-count' '1'"
         }
       ]
     },
-    "basic-ro-cat-nested": {
+    "ro-list-block-form": {
       "status": "pending",
-      "image": "xfs-basic.img",
+      "image": "xfs-content.img",
       "_attempts": [],
-      "_notes": "Read content matches sha256 on /subdir/nested.txt. Catches subdir-file extent decoding.",
+      "_notes": "200 entries push the directory out of short form into block form: a different on-disk layout and a different code path.",
       "recipe": [
         {
+          "op": "build-xfs-image"
+        },
+        {
+          "op": "verify-ls",
+          "path": "/manyentries",
+          "expect_args": "'--expect-name' 'entry-1.txt' '--expect-name' 'entry-2.txt' '--expect-name' 'entry-3.txt' '--expect-name' 'entry-4.txt' '--expect-name' 'entry-5.txt' '--expect-name' 'entry-6.txt' '--expect-name' 'entry-7.txt' '--expect-name' 'entry-8.txt' '--expect-name' 'entry-9.txt' '--expect-name' 'entry-10.txt' '--expect-name' 'entry-11.txt' '--expect-name' 'entry-12.txt' '--expect-name' 'entry-13.txt' '--expect-name' 'entry-14.txt' '--expect-name' 'entry-15.txt' '--expect-name' 'entry-16.txt' '--expect-name' 'entry-17.txt' '--expect-name' 'entry-18.txt' '--expect-name' 'entry-19.txt' '--expect-name' 'entry-20.txt' '--expect-name' 'entry-21.txt' '--expect-name' 'entry-22.txt' '--expect-name' 'entry-23.txt' '--expect-name' 'entry-24.txt' '--expect-name' 'entry-25.txt' '--expect-name' 'entry-26.txt' '--expect-name' 'entry-27.txt' '--expect-name' 'entry-28.txt' '--expect-name' 'entry-29.txt' '--expect-name' 'entry-30.txt' '--expect-name' 'entry-31.txt' '--expect-name' 'entry-32.txt' '--expect-name' 'entry-33.txt' '--expect-name' 'entry-34.txt' '--expect-name' 'entry-35.txt' '--expect-name' 'entry-36.txt' '--expect-name' 'entry-37.txt' '--expect-name' 'entry-38.txt' '--expect-name' 'entry-39.txt' '--expect-name' 'entry-40.txt' '--expect-name' 'entry-41.txt' '--expect-name' 'entry-42.txt' '--expect-name' 'entry-43.txt' '--expect-name' 'entry-44.txt' '--expect-name' 'entry-45.txt' '--expect-name' 'entry-46.txt' '--expect-name' 'entry-47.txt' '--expect-name' 'entry-48.txt' '--expect-name' 'entry-49.txt' '--expect-name' 'entry-50.txt' '--expect-name' 'entry-51.txt' '--expect-name' 'entry-52.txt' '--expect-name' 'entry-53.txt' '--expect-name' 'entry-54.txt' '--expect-name' 'entry-55.txt' '--expect-name' 'entry-56.txt' '--expect-name' 'entry-57.txt' '--expect-name' 'entry-58.txt' '--expect-name' 'entry-59.txt' '--expect-name' 'entry-60.txt' '--expect-name' 'entry-61.txt' '--expect-name' 'entry-62.txt' '--expect-name' 'entry-63.txt' '--expect-name' 'entry-64.txt' '--expect-name' 'entry-65.txt' '--expect-name' 'entry-66.txt' '--expect-name' 'entry-67.txt' '--expect-name' 'entry-68.txt' '--expect-name' 'entry-69.txt' '--expect-name' 'entry-70.txt' '--expect-name' 'entry-71.txt' '--expect-name' 'entry-72.txt' '--expect-name' 'entry-73.txt' '--expect-name' 'entry-74.txt' '--expect-name' 'entry-75.txt' '--expect-name' 'entry-76.txt' '--expect-name' 'entry-77.txt' '--expect-name' 'entry-78.txt' '--expect-name' 'entry-79.txt' '--expect-name' 'entry-80.txt' '--expect-name' 'entry-81.txt' '--expect-name' 'entry-82.txt' '--expect-name' 'entry-83.txt' '--expect-name' 'entry-84.txt' '--expect-name' 'entry-85.txt' '--expect-name' 'entry-86.txt' '--expect-name' 'entry-87.txt' '--expect-name' 'entry-88.txt' '--expect-name' 'entry-89.txt' '--expect-name' 'entry-90.txt' '--expect-name' 'entry-91.txt' '--expect-name' 'entry-92.txt' '--expect-name' 'entry-93.txt' '--expect-name' 'entry-94.txt' '--expect-name' 'entry-95.txt' '--expect-name' 'entry-96.txt' '--expect-name' 'entry-97.txt' '--expect-name' 'entry-98.txt' '--expect-name' 'entry-99.txt' '--expect-name' 'entry-100.txt' '--expect-name' 'entry-101.txt' '--expect-name' 'entry-102.txt' '--expect-name' 'entry-103.txt' '--expect-name' 'entry-104.txt' '--expect-name' 'entry-105.txt' '--expect-name' 'entry-106.txt' '--expect-name' 'entry-107.txt' '--expect-name' 'entry-108.txt' '--expect-name' 'entry-109.txt' '--expect-name' 'entry-110.txt' '--expect-name' 'entry-111.txt' '--expect-name' 'entry-112.txt' '--expect-name' 'entry-113.txt' '--expect-name' 'entry-114.txt' '--expect-name' 'entry-115.txt' '--expect-name' 'entry-116.txt' '--expect-name' 'entry-117.txt' '--expect-name' 'entry-118.txt' '--expect-name' 'entry-119.txt' '--expect-name' 'entry-120.txt' '--expect-name' 'entry-121.txt' '--expect-name' 'entry-122.txt' '--expect-name' 'entry-123.txt' '--expect-name' 'entry-124.txt' '--expect-name' 'entry-125.txt' '--expect-name' 'entry-126.txt' '--expect-name' 'entry-127.txt' '--expect-name' 'entry-128.txt' '--expect-name' 'entry-129.txt' '--expect-name' 'entry-130.txt' '--expect-name' 'entry-131.txt' '--expect-name' 'entry-132.txt' '--expect-name' 'entry-133.txt' '--expect-name' 'entry-134.txt' '--expect-name' 'entry-135.txt' '--expect-name' 'entry-136.txt' '--expect-name' 'entry-137.txt' '--expect-name' 'entry-138.txt' '--expect-name' 'entry-139.txt' '--expect-name' 'entry-140.txt' '--expect-name' 'entry-141.txt' '--expect-name' 'entry-142.txt' '--expect-name' 'entry-143.txt' '--expect-name' 'entry-144.txt' '--expect-name' 'entry-145.txt' '--expect-name' 'entry-146.txt' '--expect-name' 'entry-147.txt' '--expect-name' 'entry-148.txt' '--expect-name' 'entry-149.txt' '--expect-name' 'entry-150.txt' '--expect-name' 'entry-151.txt' '--expect-name' 'entry-152.txt' '--expect-name' 'entry-153.txt' '--expect-name' 'entry-154.txt' '--expect-name' 'entry-155.txt' '--expect-name' 'entry-156.txt' '--expect-name' 'entry-157.txt' '--expect-name' 'entry-158.txt' '--expect-name' 'entry-159.txt' '--expect-name' 'entry-160.txt' '--expect-name' 'entry-161.txt' '--expect-name' 'entry-162.txt' '--expect-name' 'entry-163.txt' '--expect-name' 'entry-164.txt' '--expect-name' 'entry-165.txt' '--expect-name' 'entry-166.txt' '--expect-name' 'entry-167.txt' '--expect-name' 'entry-168.txt' '--expect-name' 'entry-169.txt' '--expect-name' 'entry-170.txt' '--expect-name' 'entry-171.txt' '--expect-name' 'entry-172.txt' '--expect-name' 'entry-173.txt' '--expect-name' 'entry-174.txt' '--expect-name' 'entry-175.txt' '--expect-name' 'entry-176.txt' '--expect-name' 'entry-177.txt' '--expect-name' 'entry-178.txt' '--expect-name' 'entry-179.txt' '--expect-name' 'entry-180.txt' '--expect-name' 'entry-181.txt' '--expect-name' 'entry-182.txt' '--expect-name' 'entry-183.txt' '--expect-name' 'entry-184.txt' '--expect-name' 'entry-185.txt' '--expect-name' 'entry-186.txt' '--expect-name' 'entry-187.txt' '--expect-name' 'entry-188.txt' '--expect-name' 'entry-189.txt' '--expect-name' 'entry-190.txt' '--expect-name' 'entry-191.txt' '--expect-name' 'entry-192.txt' '--expect-name' 'entry-193.txt' '--expect-name' 'entry-194.txt' '--expect-name' 'entry-195.txt' '--expect-name' 'entry-196.txt' '--expect-name' 'entry-197.txt' '--expect-name' 'entry-198.txt' '--expect-name' 'entry-199.txt' '--expect-name' 'entry-200.txt'"
+        },
+        {
+          "op": "verify-ls",
+          "path": "/manyentries",
+          "expect_args": "'--expect-count' '200'"
+        }
+      ]
+    },
+    "ro-cat-small": {
+      "status": "pending",
+      "image": "xfs-content.img",
+      "_attempts": [],
+      "_notes": "A short file's exact bytes.",
+      "recipe": [
+        {
+          "op": "build-xfs-image"
+        },
+        {
           "op": "verify-cat",
-          "path": "/subdir/nested.txt",
-          "expect_args": "'--expect-size' '7' '--expect-sha256' '370a8c04b8a65bb4494275eec227f1b694db04c76da6b0b8ae88ed1ab19790a3'"
+          "path": "/small.txt",
+          "expect_args": "'--expect-size' '9' '--expect-sha256' '16ef1af35227a84c4a170c9d45f3a91a7cfa0bb54855cb79d3f8cfeea4e51888'"
+        }
+      ]
+    },
+    "ro-cat-empty": {
+      "status": "pending",
+      "image": "xfs-content.img",
+      "_attempts": [],
+      "_notes": "An empty file reads as zero bytes, not an error.",
+      "recipe": [
+        {
+          "op": "build-xfs-image"
+        },
+        {
+          "op": "verify-cat",
+          "path": "/empty.txt",
+          "expect_args": "'--expect-size' '0' '--expect-sha256' 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'"
+        }
+      ]
+    },
+    "ro-cat-pattern": {
+      "status": "pending",
+      "image": "xfs-content.img",
+      "_attempts": [],
+      "_notes": "3 MiB whose every 8 bytes are their own offset: several extents, and a read from the wrong offset fails the hash.",
+      "recipe": [
+        {
+          "op": "build-xfs-image"
+        },
+        {
+          "op": "verify-cat",
+          "path": "/pattern.bin",
+          "expect_args": "'--expect-size' '3145728' '--expect-sha256' 'ccede7c5733fbd7c02c5595c4cb604eec44d92694f6416221807694bb00de2a9'"
+        }
+      ]
+    },
+    "ro-cat-deep": {
+      "status": "pending",
+      "image": "xfs-content.img",
+      "_attempts": [],
+      "_notes": "A file three directories down, and one a level down.",
+      "recipe": [
+        {
+          "op": "build-xfs-image"
+        },
+        {
+          "op": "verify-cat",
+          "path": "/dir/nested/deep/leaf.txt",
+          "expect_args": "'--expect-size' '11' '--expect-sha256' '1b7aee36587df6807fcd1d5efd8118b08dfe7e7ce5e8840c227e34924d766a78'"
+        },
+        {
+          "op": "verify-cat",
+          "path": "/dir/one.txt",
+          "expect_args": "'--expect-size' '9' '--expect-sha256' 'aa0ba8f8ddb4833e9574c2eba399f7491d1f5b554b624a986cd4179a40034e39'"
         }
       ]
     },
     "win-mount-ls-root": {
       "status": "pending",
-      "image": "xfs-basic.img",
+      "image": "xfs-content.img",
       "_attempts": [],
-      "_notes": "End-to-end vm-side mount + listing via WinFsp drive letter. Self-contained mount-do-unmount per win-ls-via-mount step (cross-step persistent mounts don't survive single-SSH-per-step dispatch).",
+      "_notes": "The root directory through a read-only WinFsp mount, as Explorer lists it.",
       "recipe": [
         {
+          "op": "build-xfs-image"
+        },
+        {
           "op": "ship-to-vm",
-          "src": "{image_dir}/xfs-basic.img",
-          "dest": "{vm.workdir}/xfs-basic.img"
+          "src": "{image_dir}/{run_id}/xfs-content.img",
+          "dest": "{vm.workdir}/xfs-content.img"
         },
         {
           "op": "win-ls-via-mount",
           "path": "/",
-          "expect_names_csv": ".,..,subdir,test.txt",
+          "expect_names_csv": ".,..,small.txt,empty.txt,pattern.bin,dir,manyentries,link-to-small,dangling-link,naïve-café.txt",
+          "expect_count": "10",
           "drive": "Z",
-          "expect_count": "__none__",
+          "rw_flag": "--ro",
           "extra": "__none__"
         }
       ]
     },
-    "win-mount-cat-test-txt": {
+    "win-mount-cat-small": {
       "status": "pending",
-      "image": "xfs-basic.img",
+      "image": "xfs-content.img",
       "_attempts": [],
-      "_notes": "End-to-end vm-side mount + read of /test.txt via WinFsp drive letter. Validates the full WinFsp -> rust-fs-xfs read path on Windows.",
+      "_notes": "A short file's bytes through the mount.",
       "recipe": [
         {
+          "op": "build-xfs-image"
+        },
+        {
           "op": "ship-to-vm",
-          "src": "{image_dir}/xfs-basic.img",
-          "dest": "{vm.workdir}/xfs-basic.img"
+          "src": "{image_dir}/{run_id}/xfs-content.img",
+          "dest": "{vm.workdir}/xfs-content.img"
         },
         {
           "op": "win-cat-via-mount",
-          "path": "/test.txt",
-          "expect_size": "17",
-          "expect_sha256": "68f426e9fbc8c7bb8ccb49037bc2aab582009cf499a57bffdf7b4971d9eef196",
-          "drive": "Z",
+          "path": "/small.txt",
           "expect_content": "__none__",
+          "expect_size": "9",
+          "expect_sha256": "16ef1af35227a84c4a170c9d45f3a91a7cfa0bb54855cb79d3f8cfeea4e51888",
+          "drive": "Z",
+          "rw_flag": "--ro",
           "extra": "__none__"
         }
       ]
     },
-    "overlay-sidecar-marker": {
-      "status": "blocked-needs-sidecar-op-shape",
-      "image": "xfs-basic.img",
+    "win-mount-cat-pattern": {
+      "status": "pending",
+      "image": "xfs-content.img",
       "_attempts": [],
-      "_notes": "Placeholder for overlay-sidecar (--scratch-sidecar) coverage. The driver's RW path is in-memory overlay only; on dismount with --scratch-sidecar=PATH it serialises overlay state to JSON. The shared scripts/win/ ops don't have a sidecar emit + replay op shape, and per inst 2's review that shape is consumer-specific (not upstream-worthy). Unblock requires writing xfs-specific powershell op-defs in this repo's scripts/win/xfs-sidecar-*.ps1 plus matching [ops.xfs-sidecar-*] entries in harness.toml. Defer until the user signals interest in RW coverage."
+      "_notes": "The 3 MiB pattern through the mount: ranged reads by the Windows cache manager, checked by hash.",
+      "recipe": [
+        {
+          "op": "build-xfs-image"
+        },
+        {
+          "op": "ship-to-vm",
+          "src": "{image_dir}/{run_id}/xfs-content.img",
+          "dest": "{vm.workdir}/xfs-content.img"
+        },
+        {
+          "op": "win-cat-via-mount",
+          "path": "/pattern.bin",
+          "expect_content": "__none__",
+          "expect_size": "3145728",
+          "expect_sha256": "ccede7c5733fbd7c02c5595c4cb604eec44d92694f6416221807694bb00de2a9",
+          "drive": "Z",
+          "rw_flag": "--ro",
+          "extra": "__none__"
+        }
+      ]
     }
   }
 }
