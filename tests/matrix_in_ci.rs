@@ -79,14 +79,15 @@ fn every_scenario_runs_on_an_image_this_repository_builds() {
 
 #[test]
 fn ci_runs_the_matrix_on_windows_with_a_floor() {
-    let ci = read(".github/workflows/ci.yml");
+    // The matrix's jobs live in matrix.yml, which ci.yml calls (#7).
+    let ci = read(".github/workflows/matrix.yml");
     assert!(
         ci.contains("scripts/run-matrix.sh"),
-        "ci.yml does not run the matrix"
+        "matrix.yml does not run the matrix"
     );
     assert!(
         ci.contains("scripts/matrix-floor.sh"),
-        "ci.yml does not hold the matrix to a floor of executed scenarios"
+        "matrix.yml does not hold the matrix to a floor of executed scenarios"
     );
     assert!(exists("scripts/run-matrix.sh"), "no scripts/run-matrix.sh");
     assert!(
