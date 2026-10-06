@@ -122,7 +122,7 @@ What the fixes were, since the split matters more than the count:
   away, so every read here is two. That waste is what a handle-style API
   would remove.
 - **Four were the overlay's rebuild path**, which serialises the overlay
-  into a fresh image through the reader's `mkfs`. `am-fs-xfs` has none,
+  into a fresh image through the reader's `mkfs`. `rust-fs-xfs` has none,
   so `DismountPolicy::Rebuild`, `rebuild_image` and `--scratch-rebuild`
   are **removed rather than stubbed**. A variant that always answers
   "not supported" is a promise the type cannot keep, and the flag would

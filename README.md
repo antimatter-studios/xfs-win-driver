@@ -2,7 +2,7 @@
 
 ## Overview
 
-Windows-first userspace tooling for **XFS** (Enhanced Read-Only File System) volumes, built on the [rust-fs-xfs](https://github.com/antimatter-studios/rust-fs-xfs) library (crate `am-fs-xfs`) and the [WinFsp](https://winfsp.dev/) FUSE-equivalent for Windows.
+Windows-first userspace tooling for **XFS** (Enhanced Read-Only File System) volumes, built on the [rust-fs-xfs](https://github.com/antimatter-studios/rust-fs-xfs) library (crate `rust-fs-xfs`) and the [WinFsp](https://winfsp.dev/) FUSE-equivalent for Windows.
 
 XFS is the on-disk format used for `system.img`, `vendor.img`, `product.img` on Android 10+, and increasingly for ChromeOS containers and embedded immutable-OS images. This driver lets Windows users browse those images natively as drive letters.
 
@@ -14,7 +14,7 @@ Scope:
 4. **Read-write overlay** — XFS is read-only by format, but the driver fakes a writable volume via an in-memory overlay layer. Stage edits, then either discard them, archive them to a JSON sidecar, or commit them by rebuilding a new XFS image. See [Read/write semantics](#readwrite-semantics) below.
 5. **Setup.exe** — bundles WinFsp via a Burn bootstrapper, so end users only run one installer.
 
-The library lives in the [rust-fs-xfs](https://github.com/antimatter-studios/rust-fs-xfs) project (crate `am-fs-xfs`), path-depended at `../rust-fs-xfs/`; this crate is the distribution unit.
+The library lives in the [rust-fs-xfs](https://github.com/antimatter-studios/rust-fs-xfs) project (crate `rust-fs-xfs`), path-depended at `../rust-fs-xfs/`; this crate is the distribution unit.
 
 The Windows-driver scaffolding (SCM service, disk-arrival watcher, WinFsp.Launcher integration, partition-table walker, raw-device I/O, installer + CI templates) lives in [winfsp-fs-skeleton](https://github.com/antimatter-studios/winfsp-fs-skeleton). xfs-win-driver is the **second consumer** of that skeleton (after `ext4-win-driver`). See [The skeleton split](#the-skeleton-split) below for the boundary.
 
@@ -134,7 +134,7 @@ The platform plumbing was extracted into [winfsp-fs-skeleton](https://github.com
 | Lives in skeleton (reusable) | Lives here (XFS-specific) |
 |---|---|
 | `service::run<B>` — SCM dispatcher + WinFsp.Launcher | [`src/main.rs`](./src/main.rs) — `XfsBackend` impl (4 const + 1 fn), CLI dispatch |
-| `watch::run<B>` — foreground variant | [`src/mount.rs`](./src/mount.rs) — WinFsp `FileSystemContext` impl, am-fs-xfs callbacks |
+| `watch::run<B>` — foreground variant | [`src/mount.rs`](./src/mount.rs) — WinFsp `FileSystemContext` impl, rust-fs-xfs callbacks |
 | `partition` — MBR/GPT parsing | [`src/probe.rs`](./src/probe.rs) — `is_xfs` magic-byte predicate |
 | `device` — `BlockSource` + sector-aligned `FileSource` | [`src/overlay.rs`](./src/overlay.rs) — in-memory R/W overlay layer |
 | `probe` — drive-letter selection, `GUID_DEVINTERFACE_DISK`, `DEV_BROADCAST_DEVICEINTERFACE_W` parsing | |
@@ -230,7 +230,7 @@ This requires WinFsp installed and runs only on Windows. (The `--ignored` test c
 
 - **XFS is read-only by format**. The "writable mount" is an in-memory overlay; persistence requires explicit `--scratch-sidecar` or `--scratch-rebuild` on dismount.
 - **Overlay is in-memory**. Large writes (multi-GB) can OOM. Use `--scratch-rebuild` and provision RAM accordingly.
-- **No multi-device WRITER**. The `am-fs-xfs` library reads multi-device images correctly, but the bundled `mkfs_xfs` doesn't emit them yet (upstream `mkfs.xfs --blobdev` is broken in 1.9 — we're waiting on the fix to validate against an oracle).
+- **No multi-device WRITER**. The `rust-fs-xfs` library reads multi-device images correctly, but the bundled `mkfs_xfs` doesn't emit them yet (upstream `mkfs.xfs --blobdev` is broken in 1.9 — we're waiting on the fix to validate against an oracle).
 - **Right-click verb caveat**: opening an `.img` containing multiple partitions via "Mount as xfs" mounts only the first detected XFS partition. Use the CLI with `--part N` for partition selection.
 - **Windows runtime testing pending**: development happens on macOS where the cross-platform paths are exercised. The actual WinFsp-on-Windows mount path is compile-clean but hasn't been smoke-tested on a real Windows host yet. Contributors with a WinFsp-equipped Windows 11 box welcomed.
 
@@ -238,7 +238,7 @@ This requires WinFsp installed and runs only on Windows. (The `--ignored` test c
 
 GPL-3.0-or-later — inherited from the WinFsp Rust bindings link line. The CLI subcommands that don't link winfsp (`info`, `ls`, `cat`, `watch`) work cross-platform and could be relicensed if split out, but the single-license declaration keeps the distribution unit simple.
 
-The underlying [rust-fs-xfs](https://github.com/antimatter-studios/rust-fs-xfs) library (crate `am-fs-xfs`) is **MIT** — one-way compatible (MIT flows cleanly into GPL-3 distributions). All transitive dependencies are permissive (MIT / Apache-2 / BSD / Zlib / 0BSD); no GPL/LGPL pulled in. A pre-distribution IP audit confirms the cleanroom posture.
+The underlying [rust-fs-xfs](https://github.com/antimatter-studios/rust-fs-xfs) library (crate `rust-fs-xfs`) is **MIT** — one-way compatible (MIT flows cleanly into GPL-3 distributions). All transitive dependencies are permissive (MIT / Apache-2 / BSD / Zlib / 0BSD); no GPL/LGPL pulled in. A pre-distribution IP audit confirms the cleanroom posture.
 
 External tools (`mkfs.xfs`, `fsck.xfs`, `dump.xfs`) are invoked at arm's length via subprocess from `#[ignore]`-gated integration tests in the library only — never linked, never source-copied.
 
