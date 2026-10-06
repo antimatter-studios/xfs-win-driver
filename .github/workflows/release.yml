@@ -86,6 +86,13 @@ jobs:
               git -C "../$name" checkout --quiet FETCH_HEAD
             done
 
+      # A tag the CHANGELOG does not describe stops here, before anything is
+      # built: the release's notes are that section (rust-fs-core#209).
+      - name: the CHANGELOG describes this version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: bash ../rust-fs-core/scripts/release-notes.sh --unattested "$GITHUB_REF_NAME" >/dev/null
+
       - name: install Rust + gnullvm target
         shell: pwsh
         run: |
@@ -274,6 +281,12 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+      - name: rust-fs-core at the pinned ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          pin() { sed -n "s/^  $1: *//p" chores.yml | tr -d '\r'; }
+          git clone --quiet --depth 1 --branch "$(pin FS_CORE_REF)" "$(pin FS_CORE_URL)" ../rust-fs-core
       - uses: actions/download-artifact@v4
         with:
           pattern: xfs-win-driver-*
@@ -287,8 +300,13 @@ jobs:
           set -euo pipefail
           [ -n "$TAG" ] || { echo "::error::a manual run needs the tag input"; exit 1; }
           ls -l dist
-          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
-            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes
+          # The release body is this version's CHANGELOG section (rust-fs-core#209).
+          bash ../rust-fs-core/scripts/release-notes.sh --unattested "$TAG" > "$RUNNER_TEMP/release-notes.md"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$RUNNER_TEMP/release-notes.md"
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file "$RUNNER_TEMP/release-notes.md"
+          fi
           gh release upload "$TAG" dist/*-Setup.exe dist/*.msi installer/RELEASE-CHECKLIST.md \
             --repo "$GITHUB_REPOSITORY" --clobber
 
