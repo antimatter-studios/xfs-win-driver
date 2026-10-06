@@ -10,7 +10,7 @@
 #
 # WHY NOT 1.95.0. The fs-* readers pin that so a downstream FSKit build
 # links one std and one `_rust_eh_personality`. This crate links nothing
-# into that bundle -- it is a Windows binary that compiles am-fs-xfs from
+# into that bundle -- it is a Windows binary that compiles rust-fs-xfs from
 # source -- so it is free to sit on a newer compiler, and a dependency's
 # own rust-toolchain.toml is ignored anyway.
 #

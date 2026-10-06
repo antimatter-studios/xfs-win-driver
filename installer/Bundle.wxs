@@ -25,7 +25,7 @@
       Manufacturer="Chris Thomas"
       Version="$(var.Version)"
       UpgradeCode="e9306668-8966-4595-87e9-eafbf47e395e"
-      AboutUrl="https://github.com/christhomas/xfs-win-driver"
+      AboutUrl="https://github.com/antimatter-studios/xfs-win-driver"
       HelpUrl="https://winfsp.dev/">
 
     <!--

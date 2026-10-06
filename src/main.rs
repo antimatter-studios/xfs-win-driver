@@ -96,7 +96,7 @@ enum Cmd {
         scratch_sidecar: Option<PathBuf>,
         // NO --scratch-rebuild. The sibling erofs driver has one: it
         // serialises the overlay into a fresh image via that reader's
-        // mkfs. am-fs-xfs has no mkfs module, so there is nothing to
+        // mkfs. rust-fs-xfs has no mkfs module, so there is nothing to
         // build an image with, and a flag that always fails is worse
         // than a flag that is absent -- it appears in --help as though
         // it might work.

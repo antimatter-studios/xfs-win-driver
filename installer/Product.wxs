@@ -283,7 +283,7 @@
     <!-- Icon source for the shortcuts (re-uses the EXE's embedded icon, if any). -->
     <Icon Id="xfsIcon.exe" SourceFile="$(var.ExePath)" />
     <Property Id="ARPPRODUCTICON" Value="xfsIcon.exe" />
-    <Property Id="ARPURLINFOABOUT" Value="https://github.com/christhomas/xfs-win-driver" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/antimatter-studios/xfs-win-driver" />
     <Property Id="ARPHELPLINK" Value="https://winfsp.dev/" />
 
   </Package>

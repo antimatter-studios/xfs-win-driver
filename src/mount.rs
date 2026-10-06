@@ -3,7 +3,7 @@
 //! `Mount` opens an XFS image — either a regular file path or, on
 //! Windows, a raw device like `\\.\PhysicalDriveN` — optionally seeking
 //! into a specific partition's byte range. The opened
-//! `am_fs_xfs::Filesystem` is then exposed to WinFsp via the
+//! `fs_xfs::Filesystem` is then exposed to WinFsp via the
 //! `FileSystemContext` trait.
 //!
 //! Read-only by design: XFS is read-only at the format level, so every
@@ -90,7 +90,7 @@ pub enum DismountPolicy {
     Sidecar(PathBuf),
     // NO `Rebuild` VARIANT, unlike erofs-win-driver. That mode
     // serialises the overlay back into a fresh image, and for EROFS it
-    // does so through `fs_erofs::mkfs::build_image`. `am-fs-xfs` has no
+    // does so through `fs_erofs::mkfs::build_image`. `rust-fs-xfs` has no
     // mkfs module: building an XFS filesystem from nothing is
     // unfinished work — the superblock writer landed, the allocation
     // group headers, btrees, root inode and log have not.
@@ -112,7 +112,7 @@ pub enum WriteMode {
     ReadOnly,
 }
 
-/// RAII handle around an opened `am_fs_xfs::Filesystem`.
+/// RAII handle around an opened `fs_xfs::Filesystem`.
 ///
 /// `pub(crate)` fields so the WinFsp adapter (defined further down) and
 /// the smoke tests can both reach in for the underlying `Filesystem`
@@ -250,7 +250,7 @@ impl Mount {
     /// precedence rules.
     /// Read a whole file, fetching the raw inode fork the reader needs.
     ///
-    /// `am-fs-xfs` threads the raw inode bytes through `read_file` and
+    /// `rust-fs-xfs` threads the raw inode bytes through `read_file` and
     /// `read_dir`, because an XFS inode keeps its extents and inline
     /// data in that fork -- the parsed `Inode` alone is not enough. So
     /// every read here is really two: resolve, then re-fetch.
@@ -526,7 +526,7 @@ fn partition_hint(image: &Path) -> String {
 #[cfg(all(windows, feature = "mount"))]
 mod winfsp_adapter {
     //! Bridge between WinFsp's `FileSystemContext` and a read-write
-    //! overlay layered atop `am_fs_xfs::Filesystem`.
+    //! overlay layered atop `fs_xfs::Filesystem`.
     //!
     //! Reads consult the in-memory overlay first; on Miss they fall
     //! through to the read-only XFS underlay. Writes always land in
@@ -555,7 +555,7 @@ mod winfsp_adapter {
     //!
     //! License posture: this module is the only place that links against
     //! the GPL-3 winfsp-rs crate. The rest of xfs-win-driver and all
-    //! of `am-fs-xfs` (MIT) flow upward into the GPL-3 unit cleanly
+    //! of `rust-fs-xfs` (MIT) flow upward into the GPL-3 unit cleanly
     //! under the GPL-3's one-way compatibility rule.
 
     use anyhow::{anyhow, Context, Result};

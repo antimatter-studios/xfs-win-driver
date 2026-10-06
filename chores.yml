@@ -24,16 +24,15 @@ chore_min_version: 0.6.0
 # against.
 
 vars:
-  # URL beside ref for each: the family is not all in one org
-  # (rust-fs-ext4 and rust-fs-ntfs live under christhomas/), and git
-  # answers a repo it cannot see with a credential prompt rather than a
-  # 404, so a reconstructed URL fails as an auth error.
+  # URL beside ref for each: a URL rebuilt from a repo name is wrong the
+  # moment a repository moves, and git answers a repo it cannot see with a
+  # credential prompt rather than a 404, so it fails as an auth error.
   FS_CORE_URL: https://github.com/antimatter-studios/rust-fs-core.git
-  FS_CORE_REF: v0.2.4
+  FS_CORE_REF: v0.3.3
   FS_XFS_URL: https://github.com/antimatter-studios/rust-fs-xfs.git
-  FS_XFS_REF: v0.6.0
+  FS_XFS_REF: v0.12.0
   SKELETON_URL: https://github.com/antimatter-studios/winfsp-fs-skeleton.git
-  SKELETON_REF: v0.2.1
+  SKELETON_REF: v0.2.2
   # fs-windows-test-harness, which fs-test-harness became at v4.0.0: the
   # matrix runs through it, in CI as on a developer's Windows VM (#7).
   HARNESS_URL: https://github.com/antimatter-studios/fs-windows-test-harness.git

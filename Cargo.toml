@@ -6,7 +6,7 @@ edition = "2021"
 # under vendor/winfsp-rs) are GPL-3.0. The CLI alone (without the `mount`
 # feature) does not link winfsp and could be relicensed if ever split out,
 # but to keep the distribution unit single-licensed we declare GPL-3.0
-# here. Our own `am-fs-xfs` library remains MIT — one-way compatible.
+# here. Our own `rust-fs-xfs` library remains MIT — one-way compatible.
 license = "GPL-3.0-or-later"
 description = "Read-only XFS (Enhanced Read-Only File System) driver for Windows, built on WinFsp."
 repository = "https://github.com/antimatter-studios/xfs-win-driver"
@@ -25,8 +25,8 @@ clap = { version = "4", features = ["derive"] }
 # for non-windows hosts so it stays in [dependencies], not the
 # windows-only block.
 winfsp-fs-skeleton = { path = "../winfsp-fs-skeleton", default-features = false }
-am-fs-core = { path = "../rust-fs-core", version = "0.2" }
-am-fs-xfs = { path = "../rust-fs-xfs", version = "0.6" }
+rust-fs-core = { path = "../rust-fs-core", version = "0.3.3" }
+rust-fs-xfs = { path = "../rust-fs-xfs", version = "0.12" }
 # `watch` subcommand uses ctrlc on Windows. Pulled in unconditionally
 # (cheap, cross-platform) so the same handler code wires the foreground
 # `watch` and the WinFsp `mount` Ctrl-C path.
