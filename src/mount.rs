@@ -515,7 +515,8 @@ pub mod ntstatus {
     pub const OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034_u32 as i32;
     /// `STATUS_INVALID_DEVICE_REQUEST`.
     pub const INVALID_DEVICE_REQUEST: i32 = 0xC000_0010_u32 as i32;
-    /// `STATUS_IO_ERROR`.
+    /// `STATUS_IO_DEVICE_ERROR`: the request failed because the device
+    /// could not complete the read.
     pub const IO_ERROR: i32 = 0xC000_0185_u32 as i32;
     /// `STATUS_FILE_CORRUPT_ERROR`.
     pub const FILE_CORRUPT_ERROR: i32 = 0xC000_0102_u32 as i32;
@@ -524,10 +525,15 @@ pub mod ntstatus {
 /// The NTSTATUS, as its raw value, that a reader error is returned to
 /// Windows as.
 ///
-/// Most lookup-style failures collapse to `STATUS_OBJECT_NAME_NOT_FOUND`
-/// -- Explorer and consumer apps treat that uniformly. Everything else
-/// becomes `STATUS_INVALID_DEVICE_REQUEST`, so it surfaces without being
-/// confused with "no such file".
+/// - Lookup-style failures collapse to `STATUS_OBJECT_NAME_NOT_FOUND`
+///   -- Explorer and consumer apps treat that uniformly.
+/// - A read the device refused is `STATUS_IO_DEVICE_ERROR`, so Windows
+///   says the volume is misbehaving rather than showing an empty folder.
+/// - Metadata that does not describe a valid filesystem -- a bad
+///   checksum, a block whose header names another block, impossible
+///   geometry -- is `STATUS_FILE_CORRUPT_ERROR`.
+/// - Everything else becomes `STATUS_INVALID_DEVICE_REQUEST`, so it
+///   surfaces without being confused with "no such file".
 pub fn ntstatus_for(err: &fs_xfs::Error) -> i32 {
     use fs_xfs::Error as E;
     match err {
@@ -537,6 +543,13 @@ pub fn ntstatus_for(err: &fs_xfs::Error) -> i32 {
         // to a caller they all mean "that path is not what you asked
         // for".
         E::NotFound | E::NotADirectory | E::NotAFile => ntstatus::OBJECT_NAME_NOT_FOUND,
+        E::Io(_) => ntstatus::IO_ERROR,
+        E::NotXfs { .. }
+        | E::BadSuperblock(_)
+        | E::ChecksumMismatch { .. }
+        | E::BlockIdentityMismatch { .. }
+        | E::CorruptLog(_)
+        | E::InvalidGeometry(_) => ntstatus::FILE_CORRUPT_ERROR,
         _ => ntstatus::INVALID_DEVICE_REQUEST,
     }
 }
@@ -547,6 +560,14 @@ pub fn ntstatus_for(err: &fs_xfs::Error) -> i32 {
 ///
 /// A name that is not UTF-8 is left out too: Windows cannot be handed
 /// it.
+///
+/// # Errors
+///
+/// Any failure to read the directory, or to read one of its children's
+/// inodes, fails the whole listing. Reporting what could be read instead
+/// would show Windows an empty or a short folder, and an empty folder is
+/// the one answer a user cannot tell from a correct one: it looks like
+/// the files are gone.
 pub fn underlay_children(
     fs: &Filesystem,
     overlay: &Overlay,
@@ -554,12 +575,8 @@ pub fn underlay_children(
     dir_path: &str,
 ) -> fs_xfs::Result<Vec<(String, Inode)>> {
     let mut pairs = Vec::new();
-    let Ok((dir, raw)) = fs.read_inode_raw(dir.ino) else {
-        return Ok(pairs);
-    };
-    let Ok(children) = fs.read_dir(&dir, &raw) else {
-        return Ok(pairs);
-    };
+    let (dir, raw) = fs.read_inode_raw(dir.ino)?;
+    let children = fs.read_dir(&dir, &raw)?;
     for e in children {
         if e.name == b"." || e.name == b".." {
             continue;
@@ -577,9 +594,7 @@ pub fn underlay_children(
         if matches!(overlay.lookup(&child_path), OverlayLookup::Deleted) {
             continue;
         }
-        if let Ok(child) = fs.read_inode(e.ino) {
-            pairs.push((name, child));
-        }
+        pairs.push((name, fs.read_inode(e.ino)?));
     }
     Ok(pairs)
 }
@@ -804,10 +819,10 @@ mod winfsp_adapter {
     // The raw values `ntstatus_for` returns are the `windows` crate's
     // constants, checked where both are in scope.
     const _: () = {
-        use windows::Win32::Foundation::{STATUS_FILE_CORRUPT_ERROR, STATUS_IO_ERROR};
+        use windows::Win32::Foundation::{STATUS_FILE_CORRUPT_ERROR, STATUS_IO_DEVICE_ERROR};
         assert!(STATUS_OBJECT_NAME_NOT_FOUND.0 == super::ntstatus::OBJECT_NAME_NOT_FOUND);
         assert!(STATUS_INVALID_DEVICE_REQUEST.0 == super::ntstatus::INVALID_DEVICE_REQUEST);
-        assert!(STATUS_IO_ERROR.0 == super::ntstatus::IO_ERROR);
+        assert!(STATUS_IO_DEVICE_ERROR.0 == super::ntstatus::IO_ERROR);
         assert!(STATUS_FILE_CORRUPT_ERROR.0 == super::ntstatus::FILE_CORRUPT_ERROR);
     };
 
