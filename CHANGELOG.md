@@ -13,6 +13,7 @@ notes are that section (rust-fs-core's `release-notes`).
 
 ### Fixed
 
+- **A transient HTTP 5xx from the chore release download no longer fails a CI job.** Every chore download in the workflows retries up to five times on any error.
 - **A directory the reader cannot list is an I/O error, never an empty folder.** A directory whose contents, or one of whose children, could not be read was shown to Windows as empty or short; the listing now fails with `STATUS_IO_DEVICE_ERROR`, or `STATUS_FILE_CORRUPT_ERROR` for corrupt metadata.
 - Make the XFS port build, and gate what it cannot yet test ([#1](https://github.com/antimatter-studios/xfs-win-driver/pull/1)).
 - Use the ranged read, which exists ([#2](https://github.com/antimatter-studios/xfs-win-driver/pull/2)).
