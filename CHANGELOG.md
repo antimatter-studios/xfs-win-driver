@@ -7,6 +7,12 @@ notes are that section (rust-fs-core's `release-notes`).
 
 ## [Unreleased]
 
+### Changed
+
+- **The winget manifest declares GPL-3.0-or-later**, the licence
+  `Cargo.toml` and the README already state, instead of GPL-3.0 only.
+
+
 ### Added
 
 - **The matrix reads a volume whose reverse-mapping tree is two levels deep.** `scripts/build-fixtures.sh` builds `xfs-rmap-deep.img` with rmapbt on and a file of 1024 one-block extents, refuses the image unless `xfs_db` reports a two-level rmap tree, and two scenarios read that file by hash, from the host and through the mount.
