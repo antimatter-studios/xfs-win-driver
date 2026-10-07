@@ -499,6 +499,91 @@ fn write_sidecar(_overlay: &Overlay, path: &Path) -> Result<()> {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Directory listing and error mapping, outside the WinFsp adapter so the
+// tests in `tests/` can reach them on any host.
+// ---------------------------------------------------------------------------
+
+/// Raw NTSTATUS values a reader error is reported to Windows as.
+///
+/// Spelled out here rather than taken from the `windows` crate so the
+/// mapping compiles, and is tested, on every host. The WinFsp adapter
+/// asserts at compile time that each one equals the `windows` crate's
+/// constant of the same name.
+pub mod ntstatus {
+    /// `STATUS_OBJECT_NAME_NOT_FOUND`.
+    pub const OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034_u32 as i32;
+    /// `STATUS_INVALID_DEVICE_REQUEST`.
+    pub const INVALID_DEVICE_REQUEST: i32 = 0xC000_0010_u32 as i32;
+    /// `STATUS_IO_ERROR`.
+    pub const IO_ERROR: i32 = 0xC000_0185_u32 as i32;
+    /// `STATUS_FILE_CORRUPT_ERROR`.
+    pub const FILE_CORRUPT_ERROR: i32 = 0xC000_0102_u32 as i32;
+}
+
+/// The NTSTATUS, as its raw value, that a reader error is returned to
+/// Windows as.
+///
+/// Most lookup-style failures collapse to `STATUS_OBJECT_NAME_NOT_FOUND`
+/// -- Explorer and consumer apps treat that uniformly. Everything else
+/// becomes `STATUS_INVALID_DEVICE_REQUEST`, so it surfaces without being
+/// confused with "no such file".
+pub fn ntstatus_for(err: &fs_xfs::Error) -> i32 {
+    use fs_xfs::Error as E;
+    match err {
+        // No BadDirent: XFS's error type has no dirent-specific
+        // corruption variant, unlike EROFS's. NotAFile joins the
+        // lookup-style failures for the same reason the others do --
+        // to a caller they all mean "that path is not what you asked
+        // for".
+        E::NotFound | E::NotADirectory | E::NotAFile => ntstatus::OBJECT_NAME_NOT_FOUND,
+        _ => ntstatus::INVALID_DEVICE_REQUEST,
+    }
+}
+
+/// The underlay's entries in directory `dir`, at `dir_path`, each with
+/// its inode: `.` and `..` left out, and names the overlay has
+/// tombstoned left out.
+///
+/// A name that is not UTF-8 is left out too: Windows cannot be handed
+/// it.
+pub fn underlay_children(
+    fs: &Filesystem,
+    overlay: &Overlay,
+    dir: &Inode,
+    dir_path: &str,
+) -> fs_xfs::Result<Vec<(String, Inode)>> {
+    let mut pairs = Vec::new();
+    let Ok((dir, raw)) = fs.read_inode_raw(dir.ino) else {
+        return Ok(pairs);
+    };
+    let Ok(children) = fs.read_dir(&dir, &raw) else {
+        return Ok(pairs);
+    };
+    for e in children {
+        if e.name == b"." || e.name == b".." {
+            continue;
+        }
+        let name = match std::str::from_utf8(&e.name) {
+            Ok(s) => s.to_string(),
+            Err(_) => continue,
+        };
+        let child_path = if dir_path == "/" {
+            format!("/{name}")
+        } else {
+            format!("{dir_path}/{name}")
+        };
+        // Tombstoned: skip.
+        if matches!(overlay.lookup(&child_path), OverlayLookup::Deleted) {
+            continue;
+        }
+        if let Ok(child) = fs.read_inode(e.ino) {
+            pairs.push((name, child));
+        }
+    }
+    Ok(pairs)
+}
+
 fn partition_hint(image: &Path) -> String {
     match partition::list(image) {
         Ok(parts) if !parts.is_empty() => {
@@ -584,7 +669,6 @@ mod winfsp_adapter {
     // is in scope on x64 / arm64 builds).
     use winfsp_sys::{FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES};
 
-    use fs_xfs::dir::DirEntry as XfsDirEntry;
     use fs_xfs::inode::{FileType, Inode};
     use fs_xfs::Filesystem;
 
@@ -709,33 +793,23 @@ mod winfsp_adapter {
             .map_err(|e| err_to_status(e).into())
     }
 
-    /// List a directory, fetching the raw inode fork alongside it.
-    /// Short-form directories store their entries inside the inode, so
-    /// the parsed struct alone is not enough.
-    fn read_children(fs: &Filesystem, inode: &Inode) -> FspResult<Vec<XfsDirEntry>> {
-        let (inode, raw) = fs.read_inode_raw(inode.ino).map_err(err_to_status)?;
-        fs.read_dir(&inode, &raw)
-            .map_err(|e| err_to_status(e).into())
+    /// Map an `fs_xfs::Error` to an NTSTATUS suitable for returning
+    /// from a WinFsp callback. The mapping itself is
+    /// [`super::ntstatus_for`], outside this module so it is tested on
+    /// every host.
+    fn err_to_status(err: fs_xfs::Error) -> windows::Win32::Foundation::NTSTATUS {
+        windows::Win32::Foundation::NTSTATUS(super::ntstatus_for(&err))
     }
 
-    /// Map an `fs_xfs::Error` to an NTSTATUS suitable for returning
-    /// from a WinFsp callback. Most lookup-style failures collapse to
-    /// `STATUS_OBJECT_NAME_NOT_FOUND` — Explorer / consumer apps treat
-    /// that uniformly. Disk-IO and format errors become
-    /// `STATUS_INVALID_DEVICE_REQUEST` so they surface but don't get
-    /// confused with "no such file."
-    fn err_to_status(err: fs_xfs::Error) -> windows::Win32::Foundation::NTSTATUS {
-        use fs_xfs::Error as E;
-        match err {
-            // No BadDirent: XFS's error type has no dirent-specific
-            // corruption variant, unlike EROFS's. NotAFile joins the
-            // lookup-style failures for the same reason the others do --
-            // to a caller they all mean "that path is not what you
-            // asked for".
-            E::NotFound | E::NotADirectory | E::NotAFile => STATUS_OBJECT_NAME_NOT_FOUND,
-            _ => STATUS_INVALID_DEVICE_REQUEST,
-        }
-    }
+    // The raw values `ntstatus_for` returns are the `windows` crate's
+    // constants, checked where both are in scope.
+    const _: () = {
+        use windows::Win32::Foundation::{STATUS_FILE_CORRUPT_ERROR, STATUS_IO_ERROR};
+        assert!(STATUS_OBJECT_NAME_NOT_FOUND.0 == super::ntstatus::OBJECT_NAME_NOT_FOUND);
+        assert!(STATUS_INVALID_DEVICE_REQUEST.0 == super::ntstatus::INVALID_DEVICE_REQUEST);
+        assert!(STATUS_IO_ERROR.0 == super::ntstatus::IO_ERROR);
+        assert!(STATUS_FILE_CORRUPT_ERROR.0 == super::ntstatus::FILE_CORRUPT_ERROR);
+    };
 
     /// Look up a path in the wrapped XFS volume, mapping any failure
     /// to an NTSTATUS the WinFsp callback can return directly.
@@ -1038,35 +1112,21 @@ mod winfsp_adapter {
 
             // 1. Build the underlay child set.
             let underlay_inode = context.inode.lock().unwrap().clone();
-            let mut underlay_pairs: Vec<(String, Inode)> = Vec::new();
-            if let Some(inode) = underlay_inode.as_ref() {
-                if let Ok(children) = read_children(self.fs(), inode) {
-                    for e in children {
-                        if e.name == b"." || e.name == b".." {
-                            continue;
-                        }
-                        let name = match std::str::from_utf8(&e.name) {
-                            Ok(s) => s.to_string(),
-                            Err(_) => continue,
-                        };
-                        let child_path = if context.unix_path == "/" {
-                            format!("/{name}")
-                        } else {
-                            format!("{}/{}", context.unix_path, name)
-                        };
-                        // Tombstoned: skip.
-                        if matches!(
-                            self.mount.overlay.lookup(&child_path),
-                            OverlayLookup::Deleted
-                        ) {
-                            continue;
-                        }
-                        if let Ok(child) = self.fs().read_inode(e.ino) {
-                            underlay_pairs.push((name, child));
-                        }
-                    }
-                }
-            }
+            //
+            // A directory the reader cannot list, or a child it cannot
+            // read, fails the whole call: reporting an empty or a short
+            // listing instead is the one answer a user cannot tell from
+            // a correct one.
+            let mut underlay_pairs: Vec<(String, Inode)> = match underlay_inode.as_ref() {
+                Some(inode) => super::underlay_children(
+                    self.fs(),
+                    &self.mount.overlay,
+                    inode,
+                    &context.unix_path,
+                )
+                .map_err(err_to_status)?,
+                None => Vec::new(),
+            };
 
             // 2. Overlay-only entries under this dir.
             let mut overlay_pairs: Vec<(String, OverlayEntry)> = Vec::new();
