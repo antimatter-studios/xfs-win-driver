@@ -43,12 +43,12 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq xfsprogs
-      - name: build the image every scenario uses
+      - name: build the images the scenarios use
         run: sudo scripts/build-fixtures.sh xfs-images
       - uses: actions/upload-artifact@v4
         with:
           name: xfs-matrix-images
-          path: xfs-images/xfs-content.img
+          path: xfs-images/*.img
           if-no-files-found: error
           retention-days: 3
 
@@ -260,7 +260,7 @@ jobs:
 
       - name: every scenario executed
         shell: bash
-        run: bash scripts/matrix-floor.sh tmp/logs/matrix.log 11
+        run: bash scripts/matrix-floor.sh tmp/logs/matrix.log 13
 
       - name: uninstall it silently, and check nothing is left behind
         if: inputs.installer != ''

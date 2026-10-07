@@ -1,6 +1,6 @@
 {
   "_format": "v2",
-  "_doc": "xfs-win-driver matrix (#7). Every scenario runs on xfs-content.img, made by scripts/build-fixtures.sh: mkfs.xfs -L DJTEST, then populated by the kernel with the files its comments describe. Host-side scenarios read it with xfs.exe; win-mount-* mount it read-only through WinFsp. Sizes and hashes are of the content that script writes.",
+  "_doc": "xfs-win-driver matrix (#7). Every scenario runs on an image made by scripts/build-fixtures.sh: xfs-content.img (mkfs.xfs -L DJTEST) or xfs-rmap-deep.img (mkfs.xfs -m rmapbt=1, with trees more than one block deep), each populated by the kernel with the files its comments describe. Host-side scenarios read it with xfs.exe; win-mount-* mount it read-only through WinFsp. Sizes and hashes are of the content that script writes.",
   "scenarios": {
     "basic-info-volume": {
       "status": "pending",
@@ -224,6 +224,48 @@
           "expect_content": "__none__",
           "expect_size": "3145728",
           "expect_sha256": "ccede7c5733fbd7c02c5595c4cb604eec44d92694f6416221807694bb00de2a9",
+          "drive": "Z",
+          "rw_flag": "--ro",
+          "extra": "__none__"
+        }
+      ]
+    },
+    "ro-cat-rmap-deep": {
+      "status": "pending",
+      "image": "xfs-rmap-deep.img",
+      "_attempts": [],
+      "_notes": "8 MiB with every odd block punched: 1024 one-block extents, so the group's reverse-mapping tree is two levels deep (build-fixtures.sh refuses the image otherwise) and the file's block map is a multi-leaf B+tree. Holes read as zeros; a read from the wrong extent fails the hash.",
+      "recipe": [
+        {
+          "op": "build-xfs-image"
+        },
+        {
+          "op": "verify-cat",
+          "path": "/deep/fragmented.bin",
+          "expect_args": "'--expect-size' '8388608' '--expect-sha256' '491c10bff217bd877e31ddeb3815ee0cb2b4e0025130fd7b2c032548156c3365'"
+        }
+      ]
+    },
+    "win-mount-cat-rmap-deep": {
+      "status": "pending",
+      "image": "xfs-rmap-deep.img",
+      "_attempts": [],
+      "_notes": "The fragmented file on the two-level rmap volume, through the mount: the Windows cache manager's ranged reads across 1024 extents and 1024 holes, checked by hash.",
+      "recipe": [
+        {
+          "op": "build-xfs-image"
+        },
+        {
+          "op": "ship-to-vm",
+          "src": "{image_dir}/{run_id}/xfs-rmap-deep.img",
+          "dest": "{vm.workdir}/xfs-rmap-deep.img"
+        },
+        {
+          "op": "win-cat-via-mount",
+          "path": "/deep/fragmented.bin",
+          "expect_content": "__none__",
+          "expect_size": "8388608",
+          "expect_sha256": "491c10bff217bd877e31ddeb3815ee0cb2b4e0025130fd7b2c032548156c3365",
           "drive": "Z",
           "rw_flag": "--ro",
           "extra": "__none__"
