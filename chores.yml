@@ -28,9 +28,9 @@ vars:
   # moment a repository moves, and git answers a repo it cannot see with a
   # credential prompt rather than a 404, so it fails as an auth error.
   FS_CORE_URL: https://github.com/antimatter-studios/rust-fs-core.git
-  FS_CORE_REF: v0.3.4
+  FS_CORE_REF: v0.3.7
   FS_XFS_URL: https://github.com/antimatter-studios/rust-fs-xfs.git
-  FS_XFS_REF: v0.12.0
+  FS_XFS_REF: v0.12.1
   SKELETON_URL: https://github.com/antimatter-studios/winfsp-fs-skeleton.git
   SKELETON_REF: v0.2.2
   # fs-windows-test-harness, which fs-test-harness became at v4.0.0: the

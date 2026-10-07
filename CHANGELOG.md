@@ -7,6 +7,10 @@ notes are that section (rust-fs-core's `release-notes`).
 
 ## [Unreleased]
 
+### Added
+
+- **The matrix reads a volume whose reverse-mapping tree is two levels deep.** `scripts/build-fixtures.sh` builds `xfs-rmap-deep.img` with rmapbt on and a file of 1024 one-block extents, refuses the image unless `xfs_db` reports a two-level rmap tree, and two scenarios read that file by hash, from the host and through the mount.
+
 ### Fixed
 
 - **A directory the reader cannot list is an I/O error, never an empty folder.** A directory whose contents, or one of whose children, could not be read was shown to Windows as empty or short; the listing now fails with `STATUS_IO_DEVICE_ERROR`, or `STATUS_FILE_CORRUPT_ERROR` for corrupt metadata.
@@ -23,5 +27,6 @@ notes are that section (rust-fs-core's `release-notes`).
 - The release builds from the sibling checkouts CI uses ([#11](https://github.com/antimatter-studios/xfs-win-driver/pull/11)).
 - The driver builds on rust-fs-xfs 0.12 and rust-fs-core 0.3 ([#12](https://github.com/antimatter-studios/xfs-win-driver/pull/12)).
 - Wip.
+- **The driver builds on rust-fs-xfs 0.12.1 and rust-fs-core 0.3.7.** Both pins are current again, and the floor of executed matrix scenarios rises from 11 to 13.
 
 
