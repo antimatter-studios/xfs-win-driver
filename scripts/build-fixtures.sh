@@ -119,7 +119,9 @@ ls -la "$IMG"
 # reads as zeros: a read from the wrong extent fails the hash.
 DEEP="$OUT/xfs-rmap-deep.img"
 rm -f "$DEEP"
-truncate -s 128M "$DEEP"
+# 300 MiB, as xfs-content.img: current xfsprogs refuses to make a
+# filesystem of 300 MB or less ("Filesystem must be larger than 300MB").
+truncate -s 300M "$DEEP"
 # rmapbt is named rather than left to mkfs's default, which has changed
 # across xfsprogs releases: this image exists to have the tree.
 mkfs.xfs -q -L DJDEEP -m rmapbt=1 "$DEEP"
