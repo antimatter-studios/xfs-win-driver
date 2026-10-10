@@ -7,6 +7,14 @@ notes are that section (rust-fs-core's `release-notes`).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The WinFsp install fails its own step when nothing was installed (#20).**
+  `choco install winfsp` exits 0 when the Chocolatey feed cannot serve the
+  package, and the job then failed much later in `winfsp-sys`'s build script.
+  `scripts/install-winfsp.ps1` retries a feed error and refuses to finish unless
+  WinFsp's headers are on disk; every workflow installs WinFsp through it.
+
 ### Changed
 
 - **The winget manifest declares GPL-3.0-or-later**, the licence
