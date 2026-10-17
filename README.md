@@ -193,7 +193,7 @@ The `overlay-sidecar` feature pulls `serde` + `serde_json` and enables `--scratc
 ### WinFsp build prerequisites
 
 - **WinFsp 2.1+** installed on the build/run machine ([winfsp.dev](https://winfsp.dev/) → MSI, or `winget install WinFsp.WinFsp`).
-- A forked [winfsp-rs](https://github.com/antimatter-studios/winfsp-rs) is path-depended at `../winfsp-rs/` on the `gnullvm-support` branch (the upstream PR is pending). The fork also requires:
+- A forked [winfsp-rs](https://github.com/antimatter-studios/winfsp-rs) is path-depended at `../winfsp-rs/` on the `fix/guard-strategy-constant-type` branch (the upstream PR is pending). The fork also requires:
   - `LLVM` for `libclang.dll` (`winget install LLVM.LLVM`)
   - LLVM-MinGW (`winget install MartinStorsjo.LLVM-MinGW.UCRT`)
 - `LIBCLANG_PATH=C:\Program Files\LLVM\bin` so bindgen can find `libclang.dll`.
